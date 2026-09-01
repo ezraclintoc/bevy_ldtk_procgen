@@ -8,6 +8,7 @@ use std::str::FromStr;
 //TODO: derive cell size from ldtk level
 const DEFAULT_CELL_SIZE: f32 = 128.0;
 
+/// Generation State
 #[derive(States, Debug, Clone, Copy, Eq, PartialEq, Hash, Default)]
 pub enum GenerationState {
     #[default]
@@ -73,7 +74,10 @@ pub struct GenerationConfig {
 
 impl Default for GenerationConfig {
     fn default() -> Self {
-        Self { camera_spawn_dist: 10000.0, max_rooms: 10000 }
+        Self {
+            camera_spawn_dist: 10000.0,
+            max_rooms: 10000,
+        }
     }
 }
 

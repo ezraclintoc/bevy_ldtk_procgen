@@ -59,6 +59,8 @@ pub fn build_room_index<'a>(levels: impl Iterator<Item = &'a Level>) -> RoomInde
                 if entity.identifier != "Door" {
                     continue;
                 }
+
+                // TODO: magic number
                 let dir = if entity.width != 16 {
                     if entity.grid.y == 0 { Dir::N } else { Dir::S }
                 } else {
@@ -164,7 +166,14 @@ pub fn spawn_if_idle(
     let config = *config;
 
     task.0 = Some(pool.spawn(async move {
-        generate_batch(&mut state, &room_idx, cam_pos, config.camera_spawn_dist, config.max_rooms, &mut rng)
+        generate_batch(
+            &mut state,
+            &room_idx,
+            cam_pos,
+            config.camera_spawn_dist,
+            config.max_rooms,
+            &mut rng,
+        )
     }));
 }
 
@@ -188,6 +197,7 @@ pub fn generate_batch(
                 .collect();
             spawn_rooms.shuffle(rng);
 
+            // TODO: Allow no spawn rooms
             placed_rooms.push(Room::new(
                 *spawn_rooms.first().expect("No spawn room found."),
                 Vec2::ZERO,
