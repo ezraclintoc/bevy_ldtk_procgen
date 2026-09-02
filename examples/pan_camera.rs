@@ -13,9 +13,9 @@ use bevy_ecs_ldtk::prelude::*;
 use bevy_ldtk_procgen::prelude::{WorldPlugin, WorldState};
 
 mod common;
-use common::{RoomSet, TILEMAP_PACKED};
+use common::{RoomSet, TINY_DUNGEON};
 
-const ROOM_SET: RoomSet = TILEMAP_PACKED;
+const ROOM_SET: RoomSet = TINY_DUNGEON;
 
 #[derive(Component)]
 struct HudText;

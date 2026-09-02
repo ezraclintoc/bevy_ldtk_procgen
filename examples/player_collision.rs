@@ -12,9 +12,9 @@ use bevy_ecs_ldtk::prelude::*;
 use bevy_ldtk_procgen::prelude::{WorldPlugin, WorldState};
 
 mod common;
-use common::{RoomSet, TILEMAP_PACKED};
+use common::{RoomSet, TINY_DUNGEON};
 
-const ROOM_SET: RoomSet = TILEMAP_PACKED;
+const ROOM_SET: RoomSet = TINY_DUNGEON;
 
 const PLAYER_SPEED: f32 = 120.0;
 const PLAYER_HALF_EXTENT: f32 = 5.0;

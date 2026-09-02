@@ -32,7 +32,7 @@ impl Default for WorldPlugin {
     fn default() -> Self {
         let config = GenerationConfig::default();
         Self {
-            ldtk_path: "rooms.ldtk".into(),
+            ldtk_path: "ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk".into(),
             debug: false,
             camera_spawn_dist: config.camera_spawn_dist,
             max_rooms: config.max_rooms,

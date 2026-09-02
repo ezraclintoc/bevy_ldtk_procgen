@@ -22,8 +22,8 @@ it is marked `pub`, because `mod world;` is private.
 | `src/world/types.rs` | `Room`, `RoomDef`, `Door`, `Dir`, `WorldState`, rect collision helpers |
 | `src/world/spatial_hash.rs` | Grid-backed broad-phase for room/door collision queries |
 | `src/world/debug.rs` | Gizmo overlays, gated on `WorldPlugin::debug` |
-| `src/world/tests.rs` | Headless tests: parse `assets/rooms.ldtk` via `serde_json`, run generation with no Bevy `App` |
-| `assets/rooms.ldtk` | Room catalog consumed by the demo and the tests |
+| `src/world/tests.rs` | Headless tests: parse `assets/ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk` via `serde_json`, run generation with no Bevy `App` |
+| `assets/ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk` | Room catalog consumed by the demo and the tests |
 
 ## Environment
 

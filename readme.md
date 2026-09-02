@@ -114,7 +114,7 @@ Dual-licensed under either [MIT](LICENSE-MIT) or [Apache License, Version 2.0](L
 
 ## Asset Credits
 
-- Tileset: [Tiny Dungeon](https://kenney.nl/assets/tiny-dungeon) by [Kenney](https://kenney.nl) (`assets/tilemap_packed.png`), licensed [CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/).
+- Tileset: [Tiny Dungeon](https://kenney.nl/assets/tiny-dungeon) by [Kenney](https://kenney.nl) (`assets/kenney_tiny-dungeon_16px.png`), licensed [CC0 1.0 Universal](https://creativecommons.org/publicdomain/zero/1.0/).
 
 ## Current Status & Known Bugs
 

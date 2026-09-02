@@ -12,9 +12,9 @@ pub struct RoomSet {
     pub grid_size: f32,
 }
 
-/// 44 rooms on Kenney-style 16px tiles: uniform 2-tile doors, full Spawn/Hallway/Room typing.
-pub const TILEMAP_PACKED: RoomSet = RoomSet {
-    ldtk_path: "ezraclintoc_tilemap-packed_16px_fixeddoors-roomtypes.ldtk",
+/// 44 rooms on Kenney's 16px Tiny Dungeon tiles: uniform 2-tile doors, full Spawn/Hallway/Room typing.
+pub const TINY_DUNGEON: RoomSet = RoomSet {
+    ldtk_path: "ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk",
     wall_layer: "WallGrid",
     grid_size: 16.0,
 };

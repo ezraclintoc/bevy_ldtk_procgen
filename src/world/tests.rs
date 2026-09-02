@@ -1,4 +1,4 @@
-//! Exercises the generation algorithm directly against `assets/rooms.ldtk`, without a
+//! Exercises the generation algorithm directly against `assets/ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk`, without a
 //! Bevy `App`/`AssetServer`: `LdtkJson` parses straight from the file via `serde_json`
 //! and implements `RawLevelAccessor` on its own.
 
@@ -20,9 +20,9 @@ const MAX_BATCHES: usize = 200;
 const MIN_EXPECTED_ROOMS: usize = 3;
 
 fn load_room_index() -> RoomIndex {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/rooms.ldtk");
-    let raw = std::fs::read_to_string(path).expect("failed to read assets/rooms.ldtk");
-    let json: LdtkJson = serde_json::from_str(&raw).expect("failed to parse assets/rooms.ldtk");
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk");
+    let raw = std::fs::read_to_string(path).expect("failed to read assets/ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk");
+    let json: LdtkJson = serde_json::from_str(&raw).expect("failed to parse assets/ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk");
     build_room_index(json.iter_raw_levels())
 }
 
