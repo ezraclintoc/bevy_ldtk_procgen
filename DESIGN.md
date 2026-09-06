@@ -166,19 +166,27 @@ pub struct FloatTagId(u16);  // ordinal into the project's named Float fields
 which is what lets `PlacementCounters::tag_counts` (§9) be a flat array instead
 of a `HashMap`.
 
-A single by-name accessor resolves either kind for setup code:
+Name resolution and value lookup are two separate steps, on two different
+types — a Catalog holds many rooms, so "the value of tag X" is only meaningful
+per room; the Catalog can only resolve a *name* to an *id*:
 
 ```rust
-pub enum TagValue { Bool(bool), Number(f32) }
 impl Catalog {
-    pub fn tag(&self, name: &str) -> Option<TagValue>;
+    pub fn tag_id(&self, name: &str) -> Option<TagId>;
+    pub fn float_tag_id(&self, name: &str) -> Option<FloatTagId>;
+}
+impl RoomDef {
+    pub fn bool_tag(&self, id: TagId) -> bool;
+    pub fn float_tag(&self, id: FloatTagId) -> f32;
 }
 ```
 
-This is a **setup-time** lookup — resolve a name into its `TagId`/`FloatTagId`
-once (plugin build, or the first time a system runs) and hold the interned
-value from then on. Looking up by string inside the placement loop reopens the
-same cost and hazard interning exists to avoid.
+Resolution is a **setup-time** lookup — call `Catalog::tag_id`/`float_tag_id`
+once (plugin build, or the first time a system needs it) and hold the returned
+id from then on. Looking up by string inside the placement loop reopens the
+same cost and hazard interning exists to avoid; there is deliberately no
+combined by-name-straight-to-value convenience method, since that would invite
+doing exactly that.
 
 **A generic string-keyed tag bag was considered and rejected.** It cannot be
 interned — the tag set would only be known at runtime, forcing a `HashMap`
