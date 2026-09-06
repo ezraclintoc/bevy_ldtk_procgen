@@ -16,8 +16,8 @@ convention enforced by review, not the compiler:
 ```
 src/
   lib.rs              public API surface, re-exports, crate docs
-  generator.rs        module root: `pub mod catalog;` etc. — no other content
   generator/          pure — imports no bevy, no bevy_ecs_ldtk
+    mod.rs            module root: `pub mod catalog;` etc. — no other content
     error.rs          CatalogError, CatalogErrors
     geom.rs           TilePos, TileRect, Dir
     catalog.rs        Catalog, RoomDef, RoomId, TagId, FloatTagId, parse + validate
@@ -25,18 +25,17 @@ src/
     spatial.rs        SpatialHash
     weight.rs         WeightConfig, PlacementCounters, sampling
     place.rs          the placement loop (§4)
-  plugin.rs           module root: GeneratorPlugin, GenerationSet, resource/event registration
   plugin/             bevy layer
+    mod.rs            module root: GeneratorPlugin, GenerationSet, resource/event registration
     load.rs           LdtkProject -> generator's neutral input type, GenerationState
     systems.rs        generate, sync_entities
     events.rs         RoomPlaced, RoomSpawned, RoomDespawned, DoorAbandoned, GenerationFailed
 ```
 
-`generator.rs`/`plugin.rs` are module roots sitting *next to* their same-named
-directories (the edition-2018-and-later layout), not `generator/mod.rs`. Both
-styles are semantically identical — pure file organization, nothing in
-`Cargo.toml`'s `[lints]` distinguishes them — chosen only so two files aren't
-both named `mod.rs` in an editor's tab bar.
+`mod.rs` (the pre-2018 style) over a sibling `generator.rs`/`plugin.rs` file
+(edition-2018-and-later) — both are semantically identical, chosen here to keep
+each module's files together in one directory rather than split across a file
+and a same-named folder.
 
 Two naming collisions to avoid on purpose: `gen` is a reserved keyword as of
 edition 2024 (this crate's edition), so the pure module is `generator`, not
