@@ -16,16 +16,14 @@ use bevy_ecs_ldtk::prelude::*;
 use bevy_ldtk_procgen::prelude::*;
 
 fn main() {
+    // No `insert_resource(LdtkSettings { .. })` here: GeneratorPlugin enforces
+    // `UseWorldTranslation` and `load_level_neighbors: false` itself, because
+    // both are load-bearing for its placement math and its culling invariant,
+    // not a consumer choice. See ARCHITECTURE.md §2.
     App::new()
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
         .add_plugins(LdtkPlugin)
         .add_plugins(setup_generator)
-        .insert_resource(LdtkSettings {
-            level_spawn_behavior: LevelSpawnBehavior::UseWorldTranslation {
-                load_level_neighbors: false,
-            },
-            ..default()
-        })
         .add_systems(Startup, (spawn_camera, spawn_hud))
         .add_systems(
             Update,

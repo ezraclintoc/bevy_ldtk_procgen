@@ -75,6 +75,37 @@ pub struct RoomDef {
 `LevelSpawnBehavior::UseWorldTranslation` positions levels by it. It is plumbed
 straight from parse to spawn and must never enter placement math.
 
+**`GeneratorPlugin` enforces `LdtkSettings` itself; this is not a consumer
+choice.** Two fields are load-bearing, not configuration:
+
+- `level_spawn_behavior: LevelSpawnBehavior::UseWorldTranslation { .. }` — the
+  spawn system's `Transform` math (above) assumes it; any other value
+  misaligns every room the generator places against what `bevy_ecs_ldtk`
+  actually renders.
+- `load_level_neighbors: false` — `bevy_ecs_ldtk`'s own neighbor auto-loading
+  would spawn rooms the plugin's spawn/cull queue doesn't know about, which is
+  precisely the Layout/spawned-entity disagreement `DESIGN.md` §8 rules out for
+  culling. Same invariant, same reasoning, different source of the drift.
+
+Enforced via a `Startup` system that force-sets only these two fields on
+`LdtkSettings`, not a blind `insert_resource` in `Plugin::build`:
+
+```rust
+fn enforce_ldtk_settings(mut settings: ResMut<LdtkSettings>) {
+    settings.level_spawn_behavior = LevelSpawnBehavior::UseWorldTranslation {
+        load_level_neighbors: false,
+    };
+}
+```
+
+`insert_resource` in `build()` would work only if the consumer never sets
+`LdtkSettings` themselves after adding the plugin — a real thing to want, for
+unrelated fields like background rendering — since the last `insert_resource`
+call wins and would silently reintroduce this bug. Every builder-chain
+`insert_resource`, regardless of its position relative to `add_plugins`,
+resolves before any `Startup` system runs, so this ordering is not fragile the
+same way.
+
 **y-up in `generator/`; the flip happens once, at parse.** LDtk is y-down, Bevy
 is y-up. The old code mixed conventions — `world_pos` was treated as y-up while
 `rects_collide_tl` computed `bottom = top - height` (y-down) — which is why it
