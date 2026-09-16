@@ -14,7 +14,7 @@ license = "MIT OR Apache-2.0"
 # Add it back once bevy_ldtk_procgen::prelude exists to satisfy it:
 #   [[example]]
 #   name = "minimal"
-autoexamples = false
+autoexamples = true
 
 [dependencies]
 bevy = {version="0.18.0", features=["pan_camera", "debug"] }

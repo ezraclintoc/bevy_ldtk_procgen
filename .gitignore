@@ -7,6 +7,7 @@ CLAUDE.md
 /docs
 /.claude
 result
+examples/testing.rs
 
 # Third-party asset, redistribution not permitted by its license.
 # Download from https://maaot.itch.io/mossy-cavern
