@@ -121,11 +121,30 @@ pub struct Catalog {
     /// Built once; only ever point-looked-up, never iterated during
     /// placement, so the `HashMap` here doesn't reintroduce §7's hazard.
     min_clearance: HashMap<(Dir, u8), TileSize>,
+    /// Which rooms have a door facing each direction — a 4-element array
+    /// indexed by discriminant, not `HashMap<Dir, _>`: iterating a `HashMap`
+    /// during placement is a reproducibility hazard even with a fixed seed
+    /// (`AGENTS.md`, invariants; DESIGN.md §7). A room with two doors facing
+    /// the same direction appears once per bucket, not once per door — this
+    /// answers "which rooms could fill a door facing this way", and
+    /// weighting toward one twice for coincidentally having two same-facing
+    /// doors would be a bug, not a feature.
+    by_door_dir: [Vec<RoomId>; 4],
 }
 
 impl Catalog {
     pub fn get(&self, id: RoomId) -> Option<&RoomDef> {
         self.rooms.get(id.0 as usize)
+    }
+
+    /// Rooms with at least one door facing `dir`. Filtered by *direction*
+    /// only — a caller matching against a specific open door still needs to
+    /// check width against that room's own `doors`, since one room's doors
+    /// facing the same direction can differ in width.
+    pub fn rooms_with_door_facing(&self, dir: Dir) -> &[RoomId] {
+        self.by_door_dir
+            .get(dir as usize)
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn tag_id(&self, name: &str) -> Option<TagId> {
@@ -246,6 +265,19 @@ pub fn build_catalog(project: &LdtkJson) -> Result<Catalog, CatalogErrors> {
         .max()
         .unwrap_or(1);
 
+    let mut by_door_dir: [Vec<RoomId>; 4] = Default::default();
+    for (i, room) in rooms.iter().enumerate() {
+        let id = RoomId(u32::try_from(i).unwrap_or(u32::MAX));
+        for door in &room.doors {
+            let Some(bucket) = by_door_dir.get_mut(door.dir as usize) else {
+                continue;
+            };
+            if !bucket.contains(&id) {
+                bucket.push(id);
+            }
+        }
+    }
+
     Ok(Catalog {
         rooms,
         bool_tag_ids,
@@ -256,6 +288,7 @@ pub fn build_catalog(project: &LdtkJson) -> Result<Catalog, CatalogErrors> {
         // yet (place.rs) — computing real values now risks guessing wrong.
         // See ARCHITECTURE.md §6.
         min_clearance: HashMap::new(),
+        by_door_dir,
     })
 }
 
@@ -563,5 +596,50 @@ mod tests {
             .find(|l| l.identifier == identifier)
             .map(|l| l.iid.clone())
             .expect("test fixture level must exist")
+    }
+
+    #[test]
+    fn by_door_dir_index_is_exact_in_both_directions() {
+        let project = load_kenney_catalog();
+        let catalog = build_catalog(&project).expect("bundled catalog should validate");
+
+        // Round-trip check, not a hand-picked example: every room listed in
+        // a direction's bucket really has a door facing that way, and every
+        // room with a door facing a direction really is listed there.
+        for dir in [Dir::N, Dir::E, Dir::S, Dir::W] {
+            let bucket = catalog.rooms_with_door_facing(dir);
+
+            for &id in bucket {
+                let def = catalog.get(id).expect("bucket must only hold real ids");
+                assert!(
+                    def.doors.iter().any(|d| d.dir == dir),
+                    "room {id:?} is listed for {dir:?} but has no door facing it"
+                );
+            }
+
+            for (i, def) in catalog.iter().enumerate() {
+                if def.doors.iter().any(|d| d.dir == dir) {
+                    let id = RoomId(i as u32);
+                    assert!(
+                        bucket.contains(&id),
+                        "room {i} has a door facing {dir:?} but isn't in its bucket"
+                    );
+                }
+            }
+        }
+
+        // Room_Spawn_1 (N/E/S doors, per the geometry test above) must
+        // appear in exactly those three buckets and not W.
+        let spawn_1 = find_level_iid(&project, "Room_Spawn_1");
+        let spawn_1_id = RoomId(
+            catalog
+                .iter()
+                .position(|r| r.iid == spawn_1)
+                .expect("Room_Spawn_1 must exist") as u32,
+        );
+        assert!(catalog.rooms_with_door_facing(Dir::N).contains(&spawn_1_id));
+        assert!(catalog.rooms_with_door_facing(Dir::E).contains(&spawn_1_id));
+        assert!(catalog.rooms_with_door_facing(Dir::S).contains(&spawn_1_id));
+        assert!(!catalog.rooms_with_door_facing(Dir::W).contains(&spawn_1_id));
     }
 }
