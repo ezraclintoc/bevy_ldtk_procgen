@@ -9,6 +9,24 @@ pub struct RoomId(pub(crate) u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PlacementId(pub(crate) u32);
 
+/// Handle for one entry in `Layout`'s open-door set. Stable across
+/// insert/remove of *other* doors — a tombstoned-slot design (not
+/// `swap_remove`), which is what makes it safe to hold onto across a frame
+/// instead of only until the next door closes. See ARCHITECTURE.md §3.
+///
+/// Carries a generation, not just a slot index: a freed slot can be reused
+/// by a brand-new door in the very next `Layout::commit` call (nothing
+/// prevents it — that's the whole point of freeing a slot), so a slot index
+/// alone can't tell "this door is still open" from "a different door now
+/// occupies where that one used to be". The generation makes a stale id
+/// compare unequal to the slot's current occupant instead of silently
+/// matching it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct OpenDoorId {
+    pub(crate) slot: u32,
+    pub(crate) generation: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TilePos {
     pub x: i32,

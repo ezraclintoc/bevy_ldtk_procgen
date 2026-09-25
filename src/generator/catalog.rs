@@ -114,6 +114,10 @@ pub struct Catalog {
     bool_tag_ids: HashMap<String, TagId>,
     float_tag_ids: HashMap<String, FloatTagId>,
     grid_size: u32,
+    /// Largest room dimension in the catalog — the spatial hash's default
+    /// cell size (ARCHITECTURE.md §5), computed once here rather than
+    /// re-scanned by every caller that needs it.
+    spatial_cell_size: u32,
     /// Built once; only ever point-looked-up, never iterated during
     /// placement, so the `HashMap` here doesn't reintroduce §7's hazard.
     min_clearance: HashMap<(Dir, u8), TileSize>,
@@ -138,6 +142,12 @@ impl Catalog {
 
     pub fn grid_size(&self) -> u32 {
         self.grid_size
+    }
+
+    /// Bounds any room's rect to at most four spatial-hash cells regardless
+    /// of grid size. See ARCHITECTURE.md §5.
+    pub fn spatial_cell_size(&self) -> u32 {
+        self.spatial_cell_size
     }
 
     pub fn len(&self) -> usize {
@@ -230,11 +240,18 @@ pub fn build_catalog(project: &LdtkJson) -> Result<Catalog, CatalogErrors> {
         .map(|(i, name)| (name.clone(), FloatTagId(i as u16)))
         .collect();
 
+    let spatial_cell_size = rooms
+        .iter()
+        .map(|r| r.size.width.max(r.size.height))
+        .max()
+        .unwrap_or(1);
+
     Ok(Catalog {
         rooms,
         bool_tag_ids,
         float_tag_ids,
         grid_size: grid_size_u32,
+        spatial_cell_size,
         // Depends on the placement loop's actual usage, which doesn't exist
         // yet (place.rs) — computing real values now risks guessing wrong.
         // See ARCHITECTURE.md §6.
