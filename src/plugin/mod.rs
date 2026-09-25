@@ -17,6 +17,7 @@ pub use events::{
     DoorAbandoned, GenerationFailed, GenerationSettled, RoomDespawned, RoomPlaced, RoomSpawned,
 };
 pub use load::GenerationState;
+use load::LdtkHandle;
 
 #[derive(Resource, Debug, Clone, Default, Deref, DerefMut)]
 pub struct CatalogRes(pub Arc<Catalog>);
@@ -86,14 +87,15 @@ impl Plugin for GeneratorPlugin {
     /// `GeneratorPlugin` to be added after `DefaultPlugins` — the same
     /// ordering requirement `bevy_ecs_ldtk`'s own `LdtkPlugin` has.
     fn build(&self, app: &mut App) {
-        let _handle = match &self.source {
+        let handle = match &self.source {
             ProjectSource::Path(path) => app.world().resource::<AssetServer>().load(path.clone()),
             ProjectSource::Handle(handle) => handle.clone(),
         };
 
         let _ = (self.generation_radius, &self.seed, &self.max_rooms);
 
-        app.init_resource::<CatalogRes>()
+        app.insert_resource(LdtkHandle(handle))
+            .init_resource::<CatalogRes>()
             .init_resource::<LayoutRes>()
             .init_state::<GenerationState>()
             .add_message::<RoomPlaced>()
@@ -102,6 +104,10 @@ impl Plugin for GeneratorPlugin {
             .add_message::<GenerationFailed>()
             .add_message::<DoorAbandoned>()
             .add_message::<GenerationSettled>()
-            .add_systems(Startup, systems::enforce_ldtk_settings);
+            .add_systems(Startup, systems::enforce_ldtk_settings)
+            .add_systems(
+                Update,
+                load::poll_ldtk_load.run_if(in_state(GenerationState::Loading)),
+            );
     }
 }

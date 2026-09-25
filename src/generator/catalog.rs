@@ -61,6 +61,15 @@ pub enum CatalogError {
     InvalidGridSize {
         found: i32,
     },
+    /// Not a `build_catalog` output — the `.ldtk` asset itself failed to
+    /// load (missing file, I/O error), before there was any JSON to
+    /// validate. Folded into this enum anyway rather than inventing a
+    /// second failure type: `GenerationFailed(CatalogErrors)` is the one
+    /// failure surface DESIGN.md §4 defines, and this still needs to reach
+    /// it.
+    AssetLoadFailed {
+        message: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
