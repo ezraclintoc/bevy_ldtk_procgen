@@ -44,6 +44,17 @@ impl std::ops::Add for TilePos {
     }
 }
 
+impl std::ops::Sub for TilePos {
+    type Output = TilePos;
+
+    fn sub(self, rhs: TilePos) -> TilePos {
+        TilePos {
+            x: self.x - rhs.x,
+            y: self.y - rhs.y,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileSize {
     pub width: u32,
