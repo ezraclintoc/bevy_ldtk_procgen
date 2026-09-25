@@ -472,11 +472,26 @@ fn build_door(
     let width = u8::try_from((extent_px / grid_size).clamp(1, i32::from(u8::MAX))).unwrap_or(1);
 
     // y-up local frame: LDtk's row 0 (top) becomes the highest row here, so
-    // an N-facing door lands at max y — see ARCHITECTURE.md §2's y-flip rule.
-    let local_y = i32::try_from(height_tiles).unwrap_or(0) - 1 - entity.grid.y;
-    let local_pos = TilePos {
-        x: entity.grid.x,
-        y: local_y,
+    // an N-facing door's footprint sits at max y — ARCHITECTURE.md §2's
+    // y-flip rule. `local_pos` is always the footprint's MIN corner: for
+    // N/S doors the flip is single-row and x is untouched, so entity.grid.x
+    // is already the min column. For E/W doors the footprint spans
+    // `width` LDtk rows starting at entity.grid.y; flipping reverses their
+    // order, so the LDtk-side *top* row (smallest raw grid.y, entity.grid.y
+    // itself) becomes the generator-side *max* row - the min is on the
+    // *other* end, `height_tiles - width - entity.grid.y`. Using the N/S
+    // formula here instead would silently point at the wrong corner for
+    // any door wider than one tile.
+    let height_tiles_i32 = i32::try_from(height_tiles).unwrap_or(0);
+    let local_pos = match dir {
+        Dir::N | Dir::S => TilePos {
+            x: entity.grid.x,
+            y: height_tiles_i32 - 1 - entity.grid.y,
+        },
+        Dir::E | Dir::W => TilePos {
+            x: entity.grid.x,
+            y: height_tiles_i32 - i32::from(width) - entity.grid.y,
+        },
     };
 
     Some(DoorDef {
@@ -587,6 +602,23 @@ mod tests {
         for door in &room.doors {
             assert_eq!(door.width, 2, "every door in this room is 2 tiles wide");
         }
+
+        // local_pos is always the footprint's min corner (both this file's
+        // module doc and build_door's comment). Hand-derived from the same
+        // raw JSON as the direction/width checks above:
+        //   N: grid=[7,0]  -> x=7,  y=8-1-0=7
+        //   E: grid=[11,4] -> x=11, y=8-width-4=8-2-4=2  (not 8-1-4=3 - that
+        //      would be the footprint's max row, the bug this test guards)
+        //   S: grid=[8,7]  -> x=8,  y=8-1-7=0
+        let door_at = |dir: Dir| {
+            room.doors
+                .iter()
+                .find(|d| d.dir == dir)
+                .unwrap_or_else(|| panic!("Room_Spawn_1 must have a {dir:?} door"))
+        };
+        assert_eq!(door_at(Dir::N).local_pos, TilePos { x: 7, y: 7 });
+        assert_eq!(door_at(Dir::E).local_pos, TilePos { x: 11, y: 2 });
+        assert_eq!(door_at(Dir::S).local_pos, TilePos { x: 8, y: 0 });
     }
 
     fn find_level_iid(project: &LdtkJson, identifier: &str) -> String {
