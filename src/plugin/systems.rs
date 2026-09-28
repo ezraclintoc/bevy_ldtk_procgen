@@ -1,24 +1,23 @@
-//! `enforce_ldtk_settings`, and `generate` — the synchronous placement
-//! driver, ARCHITECTURE.md §7. `sync_entities` (spawn/cull queue drain)
-//! isn't written yet.
+//! `enforce_ldtk_settings`, `generate` (the synchronous placement driver,
+//! ARCHITECTURE.md §7), and `sync_entities` (the spawn/cull queue drain).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy::prelude::*;
 use bevy_ecs_ldtk::prelude::*;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
-use crate::generator::catalog::Catalog;
+use crate::generator::catalog::{Catalog, RoomDef};
 use crate::generator::error::CatalogErrors;
-use crate::generator::geom::{OpenDoorId, TilePos};
+use crate::generator::geom::{OpenDoorId, PlacementId, RoomId, TilePos, TileRect};
 use crate::generator::layout::{Layout, open_door_dir, open_door_pos};
 use crate::generator::place::{StartRoom, attempt_door, place_start_room};
 use crate::generator::weight::CountBy;
 
-use super::events::{DoorAbandoned, GenerationFailed, RoomPlaced};
-use super::load::GenerationState;
-use super::{CatalogRes, GenerationAnchor, LayoutRes};
+use super::events::{DoorAbandoned, GenerationFailed, RoomDespawned, RoomPlaced, RoomSpawned};
+use super::load::{GenerationState, LdtkHandle};
+use super::{CatalogRes, CullingPolicy, GenerationAnchor, LayoutRes};
 
 /// After this many exhausted attempts (`attempt_door` returning `None`,
 /// each one a full candidate-pool exhaustion in `place.rs`'s terms), a door
@@ -30,6 +29,18 @@ const DEAD_DOOR_THRESHOLD: u32 = 3;
 /// isn't wired into `GeneratorPlugin` yet — this is a fixed number, not the
 /// final API.
 const ROOMS_PER_FRAME: usize = 10;
+
+/// How many room entities `sync_entities` introduces per frame. Entity
+/// spawning — `bevy_ecs_ldtk` materializing tilemaps — is throttled
+/// separately and independently of generation itself (DESIGN.md §5): the
+/// constant above caps placement work, this caps the tilemap-spawn cost.
+const ROOM_SPAWNS_PER_FRAME: usize = 2;
+
+/// A room is despawned beyond `CullingPolicy::Radius` times this margin,
+/// but respawned within the radius itself — the two thresholds make the
+/// hysteresis band DESIGN.md §8 requires, so an anchor wobbling on the
+/// boundary doesn't flicker rooms in and out.
+const CULL_HYSTERESIS: f32 = 1.25;
 
 #[derive(Resource, Deref, DerefMut)]
 pub(crate) struct GenRng(pub SmallRng);
@@ -51,6 +62,7 @@ pub(crate) struct GenerationConfig {
     pub generation_radius: f32,
     pub max_rooms: Option<(usize, CountBy)>,
     pub start: StartRoom,
+    pub culling: CullingPolicy,
 }
 
 /// Failure count per door. Point-looked-up and incremented by exact key,
@@ -60,6 +72,81 @@ pub(crate) struct GenerationConfig {
 #[derive(Resource, Default, Deref, DerefMut)]
 pub(crate) struct DoorAttempts(HashMap<OpenDoorId, u32>);
 
+/// One spawned room entity: a "world" for `bevy_ecs_ldtk` (`LdtkProjectHandle`
+/// + `LevelSet`) whose single level child the crate spawns at
+/// `UseWorldTranslation`'s offset. One world per placement is what allows
+/// the same level (a room template) to be instanced at many positions — a
+/// single `LevelSet` can hold an iid only once.
+///
+/// Also the `RoomSpawned { entity }` handle consumers attach gameplay to.
+#[derive(Component, Debug, Clone, Copy)]
+pub(crate) struct RoomWorld {
+    placement: PlacementId,
+}
+
+/// Marks a `RoomWorld` whose `RoomSpawned` event has been sent.
+#[derive(Component)]
+pub(crate) struct Announced;
+
+/// Translation for a room's world entity such that the level content's min
+/// corner lands on `origin` in Bevy's y-up pixel space — tiles → px and the
+/// one y-flip, both at this boundary (ARCHITECTURE.md §2).
+pub(crate) fn room_translation(origin: TilePos, def: &RoomDef, grid_size: f32) -> Vec2 {
+    let px_hei = def.size.height as f32 * grid_size;
+    let target = Vec2::new(origin.x as f32 * grid_size, origin.y as f32 * grid_size);
+    // `bevy_ecs_ldtk`'s `UseWorldTranslation` places the level child at
+    // (world_x, -(world_y + px_hei)) relative to this room entity — the
+    // level's min corner in LDtk's y-down world position, flipped exactly
+    // once, here. The room's translation cancels it.
+    let level_offset = Vec2::new(def.world_offset_px.x, -(def.world_offset_px.y + px_hei));
+    target - level_offset
+}
+
+/// Distance in tiles from the nearest anchor to `rect` — `INFINITY` with no
+/// anchors (DESIGN.md §3: zero anchors -> idle).
+fn nearest_anchor_distance(rect: TileRect, anchors: &[TilePos]) -> f32 {
+    anchors
+        .iter()
+        .map(|a| rect.distance_to(*a))
+        .fold(f32::INFINITY, f32::min)
+}
+
+/// Policy gate for introducing a room entity — the per-frame cap and the
+/// already-spawned check are `sync_entities`' own.
+fn should_spawn(
+    culling: CullingPolicy,
+    rect: TileRect,
+    anchors: &[TilePos],
+    grid_size: f32,
+) -> bool {
+    match culling {
+        CullingPolicy::Disabled => true,
+        CullingPolicy::Radius(radius_px) => {
+            nearest_anchor_distance(rect, anchors) <= radius_px / grid_size
+        }
+    }
+}
+
+/// Policy gate for despawning a room entity. Never with zero anchors — a
+/// missing anchor is the normal state during loading (DESIGN.md §3), not a
+/// reason to cull the world.
+fn should_cull(
+    culling: CullingPolicy,
+    rect: TileRect,
+    anchors: &[TilePos],
+    grid_size: f32,
+) -> bool {
+    if anchors.is_empty() {
+        return false;
+    }
+    match culling {
+        CullingPolicy::Disabled => false,
+        CullingPolicy::Radius(radius_px) => {
+            nearest_anchor_distance(rect, anchors) > radius_px * CULL_HYSTERESIS / grid_size
+        }
+    }
+}
+
 /// Force-set, not a blind `insert_resource` in `Plugin::build`: this must
 /// win even if the consumer sets `LdtkSettings` themselves for unrelated
 /// fields after adding the plugin. See ARCHITECTURE.md §2.
@@ -67,6 +154,29 @@ pub(crate) fn enforce_ldtk_settings(mut settings: ResMut<LdtkSettings>) {
     settings.level_spawn_behavior = LevelSpawnBehavior::UseWorldTranslation {
         load_level_neighbors: false,
     };
+}
+
+/// Anchor positions in y-up tile coordinates, position-sorted — never
+/// entity order: entity IDs depend on spawn order and are reused
+/// (DESIGN.md §3, "multiple anchors"). The distances both systems compute
+/// from this are commutative over the set and don't need the order; the
+/// start-room bootstrap picks *one* anchor and does.
+fn anchor_tiles(
+    anchors: &Query<&GlobalTransform, With<GenerationAnchor>>,
+    grid_size: f32,
+) -> Vec<TilePos> {
+    let mut tiles: Vec<TilePos> = anchors
+        .iter()
+        .map(|t| {
+            let px = t.translation().truncate();
+            TilePos {
+                x: (px.x / grid_size).floor() as i32,
+                y: (px.y / grid_size).floor() as i32,
+            }
+        })
+        .collect();
+    tiles.sort_by_key(|p| (p.x, p.y));
+    tiles
 }
 
 fn room_count(catalog: &Catalog, layout: &Layout, by: &CountBy) -> usize {
@@ -137,8 +247,8 @@ fn abandon_door(
 /// The synchronous placement driver (ARCHITECTURE.md §7): runs
 /// `place::attempt_door` over open doors within `generation_radius`,
 /// nearest-to-anchor first, up to `ROOMS_PER_FRAME` placements. No
-/// `Commands`, no entity queries — `sync_entities` (not written yet) is
-/// where spawning happens, kept separate so this stays trivially testable.
+/// `Commands`, no entity queries — `sync_entities` is where spawning
+/// happens, kept separate so this stays trivially testable.
 ///
 /// Meta-generation (`RoomWeights`, `DESIGN.md` §9) isn't wired in yet:
 /// every candidate currently weighs its own `weight` float tag only, via
@@ -166,25 +276,11 @@ pub(crate) fn generate(
         return;
     }
 
-    // DESIGN.md §3: zero anchors -> idle, not an error. `doors_by_distance`
-    // is commutative over the anchor set and needs no ordering, but the
-    // start-room bootstrap picks *one* anchor and so does: position-sort,
-    // never entity order — entity IDs depend on spawn order and are reused
-    // (DESIGN.md §3, "multiple anchors").
-    let mut anchor_tiles: Vec<TilePos> = anchors
-        .iter()
-        .map(|t| {
-            let px = t.translation().truncate();
-            TilePos {
-                x: (px.x / grid_size).floor() as i32,
-                y: (px.y / grid_size).floor() as i32,
-            }
-        })
-        .collect();
-    if anchor_tiles.is_empty() {
+    // DESIGN.md §3: zero anchors -> idle, not an error.
+    let anchors = anchor_tiles(&anchors, grid_size);
+    if anchors.is_empty() {
         return;
     }
-    anchor_tiles.sort_by_key(|p| (p.x, p.y));
 
     let mut placed_this_frame = 0;
 
@@ -192,7 +288,7 @@ pub(crate) fn generate(
     // else can start generation — the door loop below only fills doors that
     // already exist, and an empty Layout has none.
     if layout.placed_count() == 0 {
-        let Some(&anchor) = anchor_tiles.first() else {
+        let Some(&anchor) = anchors.first() else {
             return;
         };
         match place_start_room(&mut layout, &catalog, &config.start, anchor, &mut rng.0) {
@@ -218,7 +314,7 @@ pub(crate) fn generate(
     }
 
     let radius_tiles = config.generation_radius / grid_size;
-    let ordered = doors_by_distance(&layout, &catalog, &anchor_tiles, radius_tiles);
+    let ordered = doors_by_distance(&layout, &catalog, &anchors, radius_tiles);
 
     for door_id in ordered {
         if placed_this_frame >= ROOMS_PER_FRAME {
@@ -250,6 +346,120 @@ pub(crate) fn generate(
                 }
             }
         }
+    }
+}
+
+/// Drains the spawn queue and the cull queue against the (already updated)
+/// Layout — ARCHITECTURE.md §7. All `Commands` and entity access live here;
+/// `generate` deliberately has none.
+///
+/// Spawned entities are a cache over the Layout (DESIGN.md §1): this system
+/// never touches `LayoutRes`, so culling can't reopen doors or break seed
+/// reproduction (DESIGN.md §8).
+pub(crate) fn sync_entities(
+    mut commands: Commands,
+    catalog: Res<CatalogRes>,
+    layout: Res<LayoutRes>,
+    config: Res<GenerationConfig>,
+    handle: Res<LdtkHandle>,
+    anchors: Query<&GlobalTransform, With<GenerationAnchor>>,
+    rooms: Query<(Entity, &RoomWorld, Option<&Announced>, Option<&Children>)>,
+    level_content: Query<&Children, With<LevelIid>>,
+    mut spawned_events: MessageWriter<RoomSpawned>,
+    mut despawned_events: MessageWriter<RoomDespawned>,
+) {
+    let grid_size = catalog.grid_size() as f32;
+    if grid_size <= 0.0 {
+        return;
+    }
+    let anchors = anchor_tiles(&anchors, grid_size);
+
+    // `RoomSpawned` fires when the room's entities actually exist: the
+    // level child `bevy_ecs_ldtk` spawns has produced content of its own
+    // (layers, entities). Until then the room root exists but is empty.
+    for (entity, room_world, announced, children) in rooms.iter() {
+        if announced.is_some() {
+            continue;
+        }
+        let Some(placement) = layout.get(room_world.placement) else {
+            continue;
+        };
+        let has_content = children.into_iter().flatten().copied().any(|child| {
+            level_content
+                .get(child)
+                .is_ok_and(|content| content.iter().next().is_some())
+        });
+        if !has_content {
+            continue;
+        }
+        commands.entity(entity).insert(Announced);
+        spawned_events.write(RoomSpawned {
+            room: placement.room,
+            entity,
+        });
+    }
+
+    // Cull first: a moving anchor frees entities before new ones are
+    // introduced. Deterministic order (placement index, not query order) so
+    // the `RoomDespawned` stream itself doesn't vary run to run.
+    let mut doomed: Vec<(u32, Entity, RoomId)> = Vec::new();
+    for (entity, room_world, _, _) in rooms.iter() {
+        let Some(placement) = layout.get(room_world.placement) else {
+            continue;
+        };
+        let Some(def) = catalog.get(placement.room) else {
+            continue;
+        };
+        let rect = TileRect {
+            min: placement.origin,
+            size: def.size,
+        };
+        if should_cull(config.culling, rect, &anchors, grid_size) {
+            doomed.push((room_world.placement.0, entity, placement.room));
+        }
+    }
+    doomed.sort_by_key(|(slot, _, _)| *slot);
+    for (_, entity, room) in doomed {
+        commands.entity(entity).despawn();
+        despawned_events.write(RoomDespawned { room });
+    }
+
+    // Spawn queue: every placement without a live room entity whose
+    // nearest point is within the policy's radius, in Layout order (a
+    // `HashMap` anywhere in this path would make entity spawn order — and
+    // so every `Entity` id consumers see — vary run to run, DESIGN.md §7).
+    let live: HashSet<PlacementId> = rooms.iter().map(|(_, w, _, _)| w.placement).collect();
+    let mut spawned_this_frame = 0;
+    for (placement_id, placement) in layout.iter() {
+        if spawned_this_frame >= ROOM_SPAWNS_PER_FRAME {
+            break;
+        }
+        if live.contains(&placement_id) {
+            continue;
+        }
+        let Some(def) = catalog.get(placement.room) else {
+            continue;
+        };
+        let rect = TileRect {
+            min: placement.origin,
+            size: def.size,
+        };
+        if !should_spawn(config.culling, rect, &anchors, grid_size) {
+            continue;
+        }
+        commands.spawn((
+            LdtkProjectHandle::from(handle.0.clone()),
+            LevelSet::from_iids([def.iid.clone()]),
+            Transform::from_translation(
+                room_translation(placement.origin, def, grid_size).extend(0.0),
+            ),
+            Visibility::default(),
+            Name::new(def.identifier.clone()),
+            RoomWorld {
+                placement: placement_id,
+            },
+        ));
+        spawned_this_frame += 1;
     }
 }
 
@@ -357,5 +567,77 @@ mod tests {
             .map(|(id, _)| id);
 
         assert_eq!(unlimited.first().copied(), closest_independently);
+    }
+
+    #[test]
+    fn room_translation_lands_level_content_on_the_origin_corner() {
+        let catalog = load_catalog();
+        let grid_size = catalog.grid_size() as f32;
+        let def = catalog.iter().next().expect("fixture has rooms");
+        let origin = TilePos { x: 5, y: -3 };
+
+        let translation = room_translation(origin, def, grid_size);
+
+        // bevy_ecs_ldtk's UseWorldTranslation offset for the level child,
+        // recomputed here independently of `room_translation` — the two
+        // must cancel exactly at the origin corner.
+        let px_hei = def.size.height as f32 * grid_size;
+        let level_offset = Vec2::new(def.world_offset_px.x, -(def.world_offset_px.y + px_hei));
+        assert_eq!(
+            translation + level_offset,
+            Vec2::new(origin.x as f32 * grid_size, origin.y as f32 * grid_size),
+            "the level content's min corner must land on the placement origin"
+        );
+    }
+
+    fn unit_rect() -> TileRect {
+        TileRect {
+            min: TilePos { x: 0, y: 0 },
+            size: crate::generator::geom::TileSize {
+                width: 1,
+                height: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn cull_hysteresis_leaves_a_band_that_keeps_state() {
+        // Radius 10px at 2px/tile: respawn within 5 tiles, despawn beyond
+        // 5 * 1.25 = 6.25 tiles. Against `unit_rect` (max corner (1, 1)),
+        // an anchor's x minus 1 is its distance in tiles.
+        let policy = CullingPolicy::Radius(10.0);
+        let grid_size = 2.0;
+
+        let near = [TilePos { x: 2, y: 0 }]; // 1 tile away
+        assert!(should_spawn(policy, unit_rect(), &near, grid_size));
+        assert!(!should_cull(policy, unit_rect(), &near, grid_size));
+
+        let band = [TilePos { x: 7, y: 0 }]; // 6 tiles away: in the band
+        assert!(!should_spawn(policy, unit_rect(), &band, grid_size));
+        assert!(
+            !should_cull(policy, unit_rect(), &band, grid_size),
+            "the hysteresis band must keep a spawned room spawned"
+        );
+
+        let far = [TilePos { x: 20, y: 0 }]; // 19 tiles away
+        assert!(!should_spawn(policy, unit_rect(), &far, grid_size));
+        assert!(should_cull(policy, unit_rect(), &far, grid_size));
+    }
+
+    #[test]
+    fn culling_disabled_spawns_everything_and_culls_nothing() {
+        let policy = CullingPolicy::Disabled;
+        let far = [TilePos { x: 20, y: 0 }];
+        assert!(should_spawn(policy, unit_rect(), &far, 2.0));
+        assert!(!should_cull(policy, unit_rect(), &far, 2.0));
+    }
+
+    #[test]
+    fn no_anchors_idles_instead_of_culling() {
+        // The normal state during loading (DESIGN.md §3) — a missing anchor
+        // must not wipe the world.
+        let policy = CullingPolicy::Radius(10.0);
+        assert!(!should_spawn(policy, unit_rect(), &[], 2.0));
+        assert!(!should_cull(policy, unit_rect(), &[], 2.0));
     }
 }

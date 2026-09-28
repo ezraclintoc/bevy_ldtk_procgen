@@ -12,8 +12,8 @@ pub mod prelude {
     pub use crate::generator::place::StartRoom;
     pub use crate::generator::weight::CountBy;
     pub use crate::plugin::{
-        CatalogRes, DoorAbandoned, GenerationAnchor, GenerationFailed, GenerationSet,
-        GenerationSettled, GenerationState, GeneratorPlugin, LayoutRes, RoomDespawned, RoomPlaced,
-        RoomSpawned,
+        CatalogRes, CullingPolicy, DoorAbandoned, GenerationAnchor, GenerationFailed,
+        GenerationSet, GenerationSettled, GenerationState, GeneratorPlugin, LayoutRes,
+        RoomDespawned, RoomPlaced, RoomSpawned,
     };
 }

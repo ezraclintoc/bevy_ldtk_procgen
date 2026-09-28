@@ -35,6 +35,26 @@ pub enum GenerationSet {
     Weights,
 }
 
+/// Whether and how spawned room entities are culled (DESIGN.md §8).
+///
+/// Culling only ever despawns entities — the Layout is the truth and is
+/// never touched (`AGENTS.md`, invariants), so a culled area regenerates
+/// identically when revisited.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CullingPolicy {
+    /// Every placement spawns and stays spawned; the consumer drives any
+    /// despawning themselves.
+    Disabled,
+    /// Keep a room spawned while it is within `f32` PIXELS of any anchor;
+    /// despawn it once it is beyond that distance times a small hysteresis
+    /// margin. The band between the two thresholds keeps whatever state
+    /// the room is already in, so an anchor wobbling on the boundary
+    /// doesn't flicker (DESIGN.md §8). Should be at least
+    /// `generation_radius`, or a room can be culled the same frame it is
+    /// placed.
+    Radius(f32),
+}
+
 /// Either a path to load via `AssetServer` (the common case — see this
 /// file's `GeneratorPlugin::new`) or an already-loaded handle (for a
 /// consumer that wants to control preloading — `GeneratorPlugin::from_handle`).
@@ -49,6 +69,7 @@ pub struct GeneratorPlugin {
     seed: Option<u64>,
     max_rooms: Option<(usize, CountBy)>,
     start: StartRoom,
+    culling: CullingPolicy,
 }
 
 impl GeneratorPlugin {
@@ -59,6 +80,7 @@ impl GeneratorPlugin {
             seed: None,
             max_rooms: None,
             start: StartRoom::default(),
+            culling: CullingPolicy::Radius(generation_radius * 2.0),
         }
     }
 
@@ -72,6 +94,7 @@ impl GeneratorPlugin {
             seed: None,
             max_rooms: None,
             start: StartRoom::default(),
+            culling: CullingPolicy::Radius(generation_radius * 2.0),
         }
     }
 
@@ -90,6 +113,14 @@ impl GeneratorPlugin {
     /// catalog, so a test project needs no tagging to load.
     pub fn with_start(mut self, start: StartRoom) -> Self {
         self.start = start;
+        self
+    }
+
+    /// Culling policy (DESIGN.md §8). Defaults to
+    /// `CullingPolicy::Radius(generation_radius * 2.0)` — rooms stay
+    /// spawned well past the distance at which they are generated.
+    pub fn with_culling(mut self, culling: CullingPolicy) -> Self {
+        self.culling = culling;
         self
     }
 }
@@ -111,6 +142,7 @@ impl Plugin for GeneratorPlugin {
                 generation_radius: self.generation_radius,
                 max_rooms: self.max_rooms.clone(),
                 start: self.start.clone(),
+                culling: self.culling,
             })
             .init_resource::<DoorAttempts>()
             .init_resource::<CatalogRes>()
@@ -129,7 +161,8 @@ impl Plugin for GeneratorPlugin {
             )
             .add_systems(
                 Update,
-                systems::generate
+                (systems::generate, systems::sync_entities)
+                    .chain()
                     .after(GenerationSet::Weights)
                     .run_if(in_state(GenerationState::Ready)),
             );

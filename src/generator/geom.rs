@@ -87,6 +87,17 @@ impl TileRect {
         let max = self.max();
         pos.x >= self.min.x && pos.x < max.x && pos.y >= self.min.y && pos.y < max.y
     }
+
+    /// Distance from `pos` to the nearest point of this rect, in tiles —
+    /// `0.0` when inside. The measure spawn/cull radii are checked against
+    /// (DESIGN.md §8): a room is "near" an anchor by its closest corner,
+    /// not its center.
+    pub fn distance_to(self, pos: TilePos) -> f32 {
+        let max = self.max();
+        let dx = (self.min.x - pos.x).max(pos.x - max.x).max(0) as f32;
+        let dy = (self.min.y - pos.y).max(pos.y - max.y).max(0) as f32;
+        (dx * dx + dy * dy).sqrt()
+    }
 }
 
 /// Strict `<`: two rects sharing only an edge do not overlap.
@@ -116,5 +127,36 @@ impl Dir {
             Dir::S => Dir::N,
             Dir::W => Dir::E,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rect() -> TileRect {
+        TileRect {
+            min: TilePos { x: 0, y: 0 },
+            size: TileSize {
+                width: 4,
+                height: 3,
+            },
+        }
+    }
+
+    #[test]
+    fn distance_to_is_zero_inside_and_on_the_edge() {
+        assert_eq!(rect().distance_to(TilePos { x: 2, y: 1 }), 0.0);
+        // Strict `<` overlap semantics: the max edge is outside, but the
+        // continuous measure treats the boundary as touching (distance 0).
+        assert_eq!(rect().distance_to(TilePos { x: 4, y: 3 }), 0.0);
+    }
+
+    #[test]
+    fn distance_to_measures_axis_and_diagonal_gaps() {
+        assert_eq!(rect().distance_to(TilePos { x: 7, y: 1 }), 3.0);
+        assert_eq!(rect().distance_to(TilePos { x: 0, y: -4 }), 4.0);
+        // 3-4-5: x is 3 past max.x, y is 4 below min.y.
+        assert_eq!(rect().distance_to(TilePos { x: 7, y: -4 }), 5.0);
     }
 }
