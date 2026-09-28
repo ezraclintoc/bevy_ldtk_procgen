@@ -73,15 +73,15 @@
 
           cargoBuildFlags = [
             "--example"
-            "dungeon"
+            "minimal"
           ];
 
           postInstall = ''
-            install -Dm755 "target/${pkgs.stdenv.hostPlatform.rust.cargoShortTarget}/release/examples/dungeon" \
-              "$out/bin/dungeon"
+            install -Dm755 "target/${pkgs.stdenv.hostPlatform.rust.cargoShortTarget}/release/examples/minimal" \
+              "$out/bin/minimal"
             mkdir -p "$out/share/bevy_ldtk_procgen"
             cp -r assets "$out/share/bevy_ldtk_procgen/assets"
-            wrapProgram "$out/bin/dungeon" \
+            wrapProgram "$out/bin/minimal" \
               --set BEVY_ASSET_ROOT "$out/share/bevy_ldtk_procgen" \
               --prefix LD_LIBRARY_PATH : "${libraryPath}"
           '';
@@ -92,7 +92,7 @@
               mit
               asl20
             ];
-            mainProgram = "dungeon";
+            mainProgram = "minimal";
           };
         };
 

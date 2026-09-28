@@ -1,14 +1,11 @@
-//! Target API for the rewrite, written as a real example before the
-//! implementation exists.
+//! The full demo: streaming generation around a `GenerationAnchor`, with
+//! the output API a consumer reaches for — `RoomSpawned` to attach gameplay,
+//! `DoorAbandoned` and `GenerationFailed` surfaced, `Layout`'s room count
+//! and the point → room query on a HUD.
 //!
-//! This is deliberately not wired into the build yet (see the `autoexamples`
-//! note in `Cargo.toml`) — nothing under `bevy_ldtk_procgen::` exists to
-//! import. Getting this file to compile and run is the acceptance criterion
-//! for the rewrite: once `src/generator/` and `src/plugin/` exist, add an
-//! `[[example]]` entry back and this should just work.
-//!
-//! Deliberately excludes meta-generation (`DESIGN.md` §9) — that's a second,
-//! more advanced example once this one is settled.
+//! Run: `cargo run --example minimal` (needs the devShell on NixOS — see
+//! AGENTS.md). Deliberately excludes meta-generation (`DESIGN.md` §9) —
+//! that's a second, more advanced example once this one is settled.
 
 use bevy::prelude::*;
 use bevy_ecs_ldtk::prelude::*;

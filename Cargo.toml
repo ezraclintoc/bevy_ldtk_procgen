@@ -4,17 +4,9 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
-# examples/minimal.rs is the target API for the rewrite, written before
-# src/generator/ and src/plugin/ exist (see its module doc). It intentionally
-# does not compile yet. Cargo auto-discovers every examples/*.rs as a real
-# build target by default, which would break `cargo build --all-targets`,
-# clippy, and every hook for everyone until the rewrite lands. Disabling
-# autodiscovery keeps the file readable and real, without wiring it in.
-#
-# Add it back once bevy_ldtk_procgen::prelude exists to satisfy it:
-#   [[example]]
-#   name = "minimal"
-autoexamples = true
+# examples/ are real build targets (autoexamples): `minimal` is the full
+# demo the flake packages, `testing` the bare-bones smoke setup. They
+# double as the executable form of this crate's documented API.
 
 [dependencies]
 bevy = {version="0.18.0", features=["pan_camera", "debug"] }
