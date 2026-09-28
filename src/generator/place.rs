@@ -20,7 +20,7 @@
 
 use rand::RngExt;
 
-use super::catalog::Catalog;
+use super::catalog::{Catalog, CatalogError, RoomDef};
 use super::geom::{Dir, PlacementId, RoomId, TilePos, TileRect, overlaps};
 use super::layout::{Layout, OpenDoor, open_door_pos};
 use crate::generator::geom::OpenDoorId;
@@ -240,6 +240,121 @@ pub fn attempt_door<R: RngExt>(
     None
 }
 
+/// Which room generation begins from. DESIGN.md §2, "Starting room": the
+/// generator does not require a designated spawn room — requiring one would
+/// mean a five-room test project fails to load until something is tagged.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StartRoom {
+    /// Weighted pick from the whole catalog (the default).
+    #[default]
+    Any,
+    /// Weighted pick among rooms carrying this bool tag.
+    Tagged(String),
+    /// The level with this LDtk identifier.
+    Named(String),
+}
+
+impl StartRoom {
+    /// For `CatalogError::NoStartRoomMatched { constraint }` — the error is
+    /// only actionable if it names the constraint that nothing satisfied.
+    fn describe(&self) -> String {
+        match self {
+            StartRoom::Any => "any room".to_string(),
+            StartRoom::Tagged(tag) => format!("a room tagged {tag:?}"),
+            StartRoom::Named(name) => format!("a level named {name:?}"),
+        }
+    }
+}
+
+/// Every room `start` admits, in `Catalog::iter` order — i.e. `RoomId`
+/// order, since IDs are catalog indices.
+fn start_candidates<'a>(catalog: &'a Catalog, start: &StartRoom) -> Vec<(RoomId, &'a RoomDef)> {
+    match start {
+        StartRoom::Any => catalog
+            .iter()
+            .enumerate()
+            .map(|(i, def)| (RoomId(i as u32), def))
+            .collect(),
+        StartRoom::Tagged(name) => {
+            let Some(tag) = catalog.tag_id(name) else {
+                return Vec::new();
+            };
+            catalog
+                .iter()
+                .enumerate()
+                .filter(|(_, def)| def.bool_tag(tag))
+                .map(|(i, def)| (RoomId(i as u32), def))
+                .collect()
+        }
+        StartRoom::Named(name) => catalog
+            .iter()
+            .enumerate()
+            .filter(|(_, def)| def.identifier == *name)
+            .map(|(i, def)| (RoomId(i as u32), def))
+            .collect(),
+    }
+}
+
+/// Picks and commits the very first placement, centered on `anchor` — the
+/// dungeon begins where the anchor (player, camera) is, and generation
+/// proceeds outward from there (`generate`, `plugin/systems.rs`, calls this
+/// only while the Layout is empty). Selection is a weighted pick over the
+/// rooms `start` admits, by the same `weight` float tag `attempt_door` uses.
+///
+/// `NoStartRoomMatched` is conditional exactly as DESIGN.md §2 says: under
+/// `StartRoom::Any` the candidate pool is the whole catalog, so the error
+/// only arises when a `Tagged`/`Named` constraint matches nothing.
+pub fn place_start_room<R: RngExt>(
+    layout: &mut Layout,
+    catalog: &Catalog,
+    start: &StartRoom,
+    anchor: TilePos,
+    rng: &mut R,
+) -> Result<PlacementId, CatalogError> {
+    let candidates = start_candidates(catalog, start);
+    let no_match = || CatalogError::NoStartRoomMatched {
+        constraint: start.describe(),
+    };
+
+    let weight_tag = catalog.float_tag_id("weight");
+    let weights: Vec<f32> = candidates
+        .iter()
+        .map(|(_, def)| {
+            let base = weight_tag.map(|id| def.float_tag(id)).unwrap_or(1.0);
+            base.max(0.0)
+        })
+        .collect();
+
+    // Uniform fallback when every weight is zero: a zero weight should
+    // mean "unselectable in preference", not "the dungeon refuses to
+    // start" — especially since DESIGN.md §2 promises `NoStartRoomMatched`
+    // cannot arise under `Any`. (`random_range` panics on an empty range,
+    // hence the emptiness guard — this crate denies panics.)
+    let pick = sample_weighted(rng, &weights).or_else(|| {
+        if candidates.is_empty() {
+            None
+        } else {
+            Some(rng.random_range(0..candidates.len()))
+        }
+    });
+    let Some(&(room, def)) = pick.and_then(|i| candidates.get(i)) else {
+        return Err(no_match());
+    };
+
+    let origin = TilePos {
+        x: anchor.x - (def.size.width as i32) / 2,
+        y: anchor.y - (def.size.height as i32) / 2,
+    };
+
+    // The Layout is empty here, so nothing can overlap and no door can be
+    // closed — the start room only opens its own doors. `commit`'s `None`
+    // is a `RoomId` from a different Catalog, unreachable by construction
+    // (the id above was minted by enumerating this very catalog).
+    layout
+        .commit(catalog, room, origin, &[])
+        .ok_or_else(no_match)
+}
+
 #[cfg(test)]
 mod tests {
     use rand::SeedableRng;
@@ -399,5 +514,116 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn start_room_any_places_centered_on_the_anchor() {
+        let catalog = load_catalog();
+        let mut layout = Layout::default();
+        let mut rng = SmallRng::seed_from_u64(42);
+        let anchor = TilePos { x: 10, y: 7 };
+
+        let id = place_start_room(&mut layout, &catalog, &StartRoom::Any, anchor, &mut rng)
+            .expect("Any must always match");
+
+        let placement = layout.get(id).expect("just placed");
+        let def = catalog
+            .get(placement.room)
+            .expect("placed room must come from this catalog");
+        assert_eq!(
+            placement.origin,
+            TilePos {
+                x: anchor.x - (def.size.width as i32) / 2,
+                y: anchor.y - (def.size.height as i32) / 2,
+            },
+            "the start room must be centered on the anchor"
+        );
+        assert_eq!(layout.placed_count(), 1);
+    }
+
+    #[test]
+    fn start_room_named_matches_the_level_identifier() {
+        let catalog = load_catalog();
+        let identifier = catalog
+            .iter()
+            .next()
+            .expect("fixture has rooms")
+            .identifier
+            .clone();
+        let mut layout = Layout::default();
+        let mut rng = SmallRng::seed_from_u64(1);
+
+        let id = place_start_room(
+            &mut layout,
+            &catalog,
+            &StartRoom::Named(identifier.clone()),
+            TilePos { x: 0, y: 0 },
+            &mut rng,
+        )
+        .expect("a real level identifier must match");
+
+        let placement = layout.get(id).expect("just placed");
+        let def = catalog
+            .get(placement.room)
+            .expect("placed room must come from this catalog");
+        assert_eq!(def.identifier, identifier);
+    }
+
+    #[test]
+    fn start_room_named_that_matches_nothing_reports_no_start_room_matched() {
+        let catalog = load_catalog();
+        let mut layout = Layout::default();
+        let mut rng = SmallRng::seed_from_u64(1);
+
+        let err = place_start_room(
+            &mut layout,
+            &catalog,
+            &StartRoom::Named("no such level".to_string()),
+            TilePos { x: 0, y: 0 },
+            &mut rng,
+        )
+        .expect_err("an unknown level identifier must not place anything");
+
+        assert!(matches!(err, CatalogError::NoStartRoomMatched { .. }));
+        assert_eq!(layout.placed_count(), 0);
+    }
+
+    #[test]
+    fn start_room_tagged_without_the_tag_reports_no_start_room_matched() {
+        // The bundled catalog predates the tags redesign (DESIGN.md §2) -
+        // no bool tags exist at all, so nothing can carry "boss".
+        let catalog = load_catalog();
+        let mut layout = Layout::default();
+        let mut rng = SmallRng::seed_from_u64(1);
+
+        let err = place_start_room(
+            &mut layout,
+            &catalog,
+            &StartRoom::Tagged("boss".to_string()),
+            TilePos { x: 0, y: 0 },
+            &mut rng,
+        )
+        .expect_err("an unknown tag must not place anything");
+
+        assert!(matches!(err, CatalogError::NoStartRoomMatched { .. }));
+        assert_eq!(layout.placed_count(), 0);
+    }
+
+    #[test]
+    fn start_room_reproduces_for_a_fixed_seed() {
+        let catalog = load_catalog();
+        let anchor = TilePos { x: 3, y: -2 };
+
+        let mut first = Layout::default();
+        let mut second = Layout::default();
+        for layout in [&mut first, &mut second] {
+            let mut rng = SmallRng::seed_from_u64(7);
+            place_start_room(layout, &catalog, &StartRoom::Any, anchor, &mut rng)
+                .expect("Any must always match");
+        }
+
+        let a = first.iter().next().expect("just placed").1;
+        let b = second.iter().next().expect("just placed").1;
+        assert_eq!(*a, *b, "same seed must reproduce the same start placement");
     }
 }

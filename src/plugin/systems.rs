@@ -10,12 +10,14 @@ use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
 use crate::generator::catalog::Catalog;
+use crate::generator::error::CatalogErrors;
 use crate::generator::geom::{OpenDoorId, TilePos};
 use crate::generator::layout::{Layout, open_door_dir, open_door_pos};
-use crate::generator::place::attempt_door;
+use crate::generator::place::{StartRoom, attempt_door, place_start_room};
 use crate::generator::weight::CountBy;
 
-use super::events::{DoorAbandoned, RoomPlaced};
+use super::events::{DoorAbandoned, GenerationFailed, RoomPlaced};
+use super::load::GenerationState;
 use super::{CatalogRes, GenerationAnchor, LayoutRes};
 
 /// After this many exhausted attempts (`attempt_door` returning `None`,
@@ -41,13 +43,14 @@ impl GenRng {
     }
 }
 
-/// `generation_radius` and `max_rooms`, plumbed from `GeneratorPlugin`'s own
-/// fields — previously discarded entirely in `Plugin::build`
-/// (`let _ = (self.generation_radius, ...)`).
+/// `generation_radius`, `max_rooms`, and `start`, plumbed from
+/// `GeneratorPlugin`'s own fields — previously discarded entirely in
+/// `Plugin::build` (`let _ = (self.generation_radius, ...)`).
 #[derive(Resource, Clone)]
 pub(crate) struct GenerationConfig {
     pub generation_radius: f32,
     pub max_rooms: Option<(usize, CountBy)>,
+    pub start: StartRoom,
 }
 
 /// Failure count per door. Point-looked-up and incremented by exact key,
@@ -149,6 +152,8 @@ pub(crate) fn generate(
     anchors: Query<&GlobalTransform, With<GenerationAnchor>>,
     mut placed_events: MessageWriter<RoomPlaced>,
     mut abandoned_events: MessageWriter<DoorAbandoned>,
+    mut failed_events: MessageWriter<GenerationFailed>,
+    mut next_state: ResMut<NextState<GenerationState>>,
 ) {
     if let Some((max, by)) = &config.max_rooms {
         if room_count(&catalog, &layout, by) >= *max {
@@ -161,11 +166,12 @@ pub(crate) fn generate(
         return;
     }
 
-    // DESIGN.md §3: zero anchors -> idle, not an error. Position-sorting
-    // the anchors themselves doesn't change this function's behaviour
-    // (nearest-distance is commutative over the set), so it's skipped here
-    // despite DESIGN.md §3's general anchor-ordering note.
-    let anchor_tiles: Vec<TilePos> = anchors
+    // DESIGN.md §3: zero anchors -> idle, not an error. `doors_by_distance`
+    // is commutative over the anchor set and needs no ordering, but the
+    // start-room bootstrap picks *one* anchor and so does: position-sort,
+    // never entity order — entity IDs depend on spawn order and are reused
+    // (DESIGN.md §3, "multiple anchors").
+    let mut anchor_tiles: Vec<TilePos> = anchors
         .iter()
         .map(|t| {
             let px = t.translation().truncate();
@@ -178,11 +184,42 @@ pub(crate) fn generate(
     if anchor_tiles.is_empty() {
         return;
     }
+    anchor_tiles.sort_by_key(|p| (p.x, p.y));
+
+    let mut placed_this_frame = 0;
+
+    // Bootstrap: the first placement, centered on the first anchor. Nothing
+    // else can start generation — the door loop below only fills doors that
+    // already exist, and an empty Layout has none.
+    if layout.placed_count() == 0 {
+        let Some(&anchor) = anchor_tiles.first() else {
+            return;
+        };
+        match place_start_room(&mut layout, &catalog, &config.start, anchor, &mut rng.0) {
+            Ok(placement_id) => {
+                placed_this_frame += 1;
+                if let Some(placement) = layout.get(placement_id) {
+                    placed_events.write(RoomPlaced {
+                        room: placement.room,
+                        at: placement.origin,
+                    });
+                }
+            }
+            Err(error) => {
+                // DESIGN.md §2: `NoStartRoomMatched` is conditional — an
+                // error only when the developer asked for a constraint that
+                // nothing satisfies. Fail loudly (§6: a silent stall is how
+                // you end up asking why the dungeon never started).
+                failed_events.write(GenerationFailed(CatalogErrors(vec![error])));
+                next_state.set(GenerationState::Failed);
+                return;
+            }
+        }
+    }
 
     let radius_tiles = config.generation_radius / grid_size;
     let ordered = doors_by_distance(&layout, &catalog, &anchor_tiles, radius_tiles);
 
-    let mut placed_this_frame = 0;
     for door_id in ordered {
         if placed_this_frame >= ROOMS_PER_FRAME {
             break;

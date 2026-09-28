@@ -12,6 +12,7 @@ pub(crate) mod systems;
 
 use crate::generator::catalog::Catalog;
 use crate::generator::layout::Layout;
+use crate::generator::place::StartRoom;
 use crate::generator::weight::CountBy;
 pub use events::{
     DoorAbandoned, GenerationFailed, GenerationSettled, RoomDespawned, RoomPlaced, RoomSpawned,
@@ -47,6 +48,7 @@ pub struct GeneratorPlugin {
     generation_radius: f32,
     seed: Option<u64>,
     max_rooms: Option<(usize, CountBy)>,
+    start: StartRoom,
 }
 
 impl GeneratorPlugin {
@@ -56,6 +58,7 @@ impl GeneratorPlugin {
             generation_radius,
             seed: None,
             max_rooms: None,
+            start: StartRoom::default(),
         }
     }
 
@@ -68,6 +71,7 @@ impl GeneratorPlugin {
             generation_radius,
             seed: None,
             max_rooms: None,
+            start: StartRoom::default(),
         }
     }
 
@@ -78,6 +82,14 @@ impl GeneratorPlugin {
 
     pub fn with_max_rooms(mut self, max: usize, by: CountBy) -> Self {
         self.max_rooms = Some((max, by));
+        self
+    }
+
+    /// Which room generation begins from (DESIGN.md §2, "Starting room").
+    /// Defaults to `StartRoom::Any` — a weighted pick from the whole
+    /// catalog, so a test project needs no tagging to load.
+    pub fn with_start(mut self, start: StartRoom) -> Self {
+        self.start = start;
         self
     }
 }
@@ -98,6 +110,7 @@ impl Plugin for GeneratorPlugin {
             .insert_resource(GenerationConfig {
                 generation_radius: self.generation_radius,
                 max_rooms: self.max_rooms.clone(),
+                start: self.start.clone(),
             })
             .init_resource::<DoorAttempts>()
             .init_resource::<CatalogRes>()

@@ -5,9 +5,11 @@ mod generator;
 pub mod plugin;
 
 pub mod prelude {
-    pub use crate::generator::catalog::{Catalog, FloatTagId, RoomDef, TagId};
+    pub use crate::generator::catalog::{Catalog, CatalogError, FloatTagId, RoomDef, TagId};
+    pub use crate::generator::error::CatalogErrors;
     pub use crate::generator::geom::{Dir, PlacementId, RoomId, TilePos, TileRect, TileSize};
     pub use crate::generator::layout::Layout;
+    pub use crate::generator::place::StartRoom;
     pub use crate::generator::weight::CountBy;
     pub use crate::plugin::{
         CatalogRes, DoorAbandoned, GenerationAnchor, GenerationFailed, GenerationSet,

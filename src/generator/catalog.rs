@@ -90,6 +90,9 @@ pub struct FloatTagId(pub(crate) u16);
 #[derive(Debug, Clone)]
 pub struct RoomDef {
     pub iid: String,
+    /// The level's LDtk identifier — what `StartRoom::Named` matches on
+    /// (DESIGN.md §2, "Starting room").
+    pub identifier: String,
     pub size: TileSize,
     pub doors: Vec<DoorDef>,
     /// Integration-only: read by `plugin/systems.rs`, never by placement code.
@@ -398,6 +401,7 @@ fn build_room(
 
     let room = RoomDef {
         iid: level.iid.clone(),
+        identifier: level.identifier.clone(),
         size,
         doors,
         world_offset_px: PixelPos {
