@@ -18,6 +18,7 @@ pub use events::{
 };
 pub use load::GenerationState;
 use load::LdtkHandle;
+use systems::{DoorAttempts, GenRng, GenerationConfig};
 
 #[derive(Resource, Debug, Clone, Default, Deref, DerefMut)]
 pub struct CatalogRes(pub Arc<Catalog>);
@@ -92,9 +93,13 @@ impl Plugin for GeneratorPlugin {
             ProjectSource::Handle(handle) => handle.clone(),
         };
 
-        let _ = (self.generation_radius, &self.seed, &self.max_rooms);
-
         app.insert_resource(LdtkHandle(handle))
+            .insert_resource(GenRng::new(self.seed))
+            .insert_resource(GenerationConfig {
+                generation_radius: self.generation_radius,
+                max_rooms: self.max_rooms.clone(),
+            })
+            .init_resource::<DoorAttempts>()
             .init_resource::<CatalogRes>()
             .init_resource::<LayoutRes>()
             .init_state::<GenerationState>()
@@ -108,6 +113,12 @@ impl Plugin for GeneratorPlugin {
             .add_systems(
                 Update,
                 load::poll_ldtk_load.run_if(in_state(GenerationState::Loading)),
+            )
+            .add_systems(
+                Update,
+                systems::generate
+                    .after(GenerationSet::Weights)
+                    .run_if(in_state(GenerationState::Ready)),
             );
     }
 }

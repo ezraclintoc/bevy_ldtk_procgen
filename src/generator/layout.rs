@@ -7,7 +7,7 @@
 //! `WorldState::add_room` did for its two structures (ARCHITECTURE.md §5).
 
 use super::catalog::Catalog;
-use super::geom::{OpenDoorId, PlacementId, RoomId, TilePos, TileRect, TileSize};
+use super::geom::{Dir, OpenDoorId, PlacementId, RoomId, TilePos, TileRect, TileSize};
 use super::spatial::SpatialHash;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -29,6 +29,16 @@ pub fn open_door_pos(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<
     let def = catalog.get(placement.room)?;
     let door = def.doors.get(d.door as usize)?;
     Some(placement.origin + door.local_pos)
+}
+
+/// The direction *this* door faces — i.e. the placed room's own door
+/// definition, not the direction a candidate filling it would need. Used
+/// for `DoorAbandoned { at, dir }`.
+pub fn open_door_dir(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<Dir> {
+    let placement = layout.get(d.placement)?;
+    let def = catalog.get(placement.room)?;
+    let door = def.doors.get(d.door as usize)?;
+    Some(door.dir)
 }
 
 #[derive(Debug, Clone, Default)]

@@ -21,7 +21,7 @@
 use rand::RngExt;
 
 use super::catalog::Catalog;
-use super::geom::{Dir, RoomId, TilePos, TileRect, overlaps};
+use super::geom::{Dir, PlacementId, RoomId, TilePos, TileRect, overlaps};
 use super::layout::{Layout, OpenDoor, open_door_pos};
 use crate::generator::geom::OpenDoorId;
 
@@ -175,8 +175,9 @@ fn sample_weighted<R: RngExt>(rng: &mut R, weights: &[f32]) -> Option<usize> {
 ///
 /// On success, `layout` already reflects it: the placement is committed,
 /// `door_id` and every other open door the new room happens to satisfy are
-/// closed, and the new room's remaining doors are open. Returns the placed
-/// `RoomId`.
+/// closed, and the new room's remaining doors are open. Returns the new
+/// `PlacementId` — not just the `RoomId` — since the caller (`generate`,
+/// `plugin/systems.rs`) needs the placement's origin too, for `RoomPlaced`.
 ///
 /// `None` means the candidate pool was exhausted without a fit — this is
 /// one full attempt in ARCHITECTURE.md §4's terms, not a permanent failure;
@@ -187,7 +188,7 @@ pub fn attempt_door<R: RngExt>(
     catalog: &Catalog,
     door_id: OpenDoorId,
     rng: &mut R,
-) -> Option<RoomId> {
+) -> Option<PlacementId> {
     let door: OpenDoor = layout
         .open_doors()
         .find(|(id, _)| *id == door_id)
@@ -230,7 +231,7 @@ pub fn attempt_door<R: RngExt>(
             });
 
         if placed.is_some() {
-            return Some(room);
+            return placed;
         }
 
         candidates.swap_remove(pick);
