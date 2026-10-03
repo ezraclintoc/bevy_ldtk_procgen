@@ -23,7 +23,7 @@ use bevy_ecs_ldtk::ldtk::{
 };
 
 use super::error::CatalogErrors;
-use super::geom::{Dir, PixelPos, RoomId, TilePos, TileSize};
+use super::geom::{Dir, PixelPos, RoomId, TilePos, TileRect, TileSize};
 
 #[non_exhaustive]
 #[derive(Debug, Clone)]
@@ -109,6 +109,35 @@ impl RoomDef {
     pub fn float_tag(&self, id: FloatTagId) -> f32 {
         self.float_tags.get(id.0 as usize).copied().unwrap_or(0.0)
     }
+
+    /// Test-only constructor: builds a bare `RoomDef` with synthetic doors
+    /// and tags, for weight/geometry tests that need a definition-shaped
+    /// value without an LDtk level behind it. Not part of the public API —
+    /// real definitions only come from `build_catalog` (authoring happens
+    /// in LDtk, never in Rust, DESIGN.md §10).
+    #[cfg(test)]
+    pub(crate) fn test_def(
+        doors: usize,
+        door_dir: Dir,
+        size: TileSize,
+        bool_tags: Vec<bool>,
+    ) -> RoomDef {
+        RoomDef {
+            iid: String::new(),
+            identifier: String::new(),
+            size,
+            doors: (0..doors)
+                .map(|_| DoorDef {
+                    local_pos: TilePos { x: 0, y: 0 },
+                    dir: door_dir,
+                    width: 2,
+                })
+                .collect(),
+            world_offset_px: PixelPos { x: 0.0, y: 0.0 },
+            bool_tags,
+            float_tags: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -162,8 +191,51 @@ impl Catalog {
         self.min_clearance.get(&(dir, width)).copied()
     }
 
+    /// The clearance strip beyond one door (ARCHITECTURE.md §6): the space a
+    /// connecting room minimally needs — starting one tile beyond the door's
+    /// footprint, spanning the door's width along the edge and the smallest
+    /// connecting room's depth outward. A placement is valid only if it
+    /// neither occupies the strip of an open door it isn't connecting to
+    /// (that would seal the door shut for good) nor has a door of its own
+    /// whose strip is occupied by a room it isn't connecting to (that door
+    /// would open into another room's interior).
+    ///
+    /// `None` when no room in the catalog can connect through a
+    /// `(dir, width)` door — such a door can never be filled by any
+    /// candidate, so there is no clearance to protect. (Attempting to fill
+    /// it fails on the empty candidate pool before any strip is consulted.)
+    pub fn clearance_strip(&self, door_pos: TilePos, dir: Dir, width: u8) -> Option<TileRect> {
+        let size = self.min_clearance.get(&(dir, width)).copied()?;
+        let min = match dir {
+            Dir::N => TilePos {
+                x: door_pos.x,
+                y: door_pos.y + 1,
+            },
+            Dir::S => TilePos {
+                x: door_pos.x,
+                y: door_pos.y - i32::try_from(size.height).unwrap_or(0),
+            },
+            Dir::E => TilePos {
+                x: door_pos.x + 1,
+                y: door_pos.y,
+            },
+            Dir::W => TilePos {
+                x: door_pos.x - i32::try_from(size.width).unwrap_or(0),
+                y: door_pos.y,
+            },
+        };
+        Some(TileRect { min, size })
+    }
+
     pub fn grid_size(&self) -> u32 {
         self.grid_size
+    }
+
+    /// How many distinct bool tags the project defines — the `TagId` space
+    /// every per-tag array (e.g. `PlacementCounters::tag_counts`) sizes
+    /// itself to. Zero for projects predating the tags schema.
+    pub fn tag_count(&self) -> usize {
+        self.bool_tag_ids.len()
     }
 
     /// Bounds any room's rect to at most four spatial-hash cells regardless
@@ -267,6 +339,7 @@ pub fn build_catalog(project: &LdtkJson) -> Result<Catalog, CatalogErrors> {
         .map(|r| r.size.width.max(r.size.height))
         .max()
         .unwrap_or(1);
+    let min_clearance = compute_min_clearance(&rooms);
 
     let mut by_door_dir: [Vec<RoomId>; 4] = Default::default();
     for (i, room) in rooms.iter().enumerate() {
@@ -287,12 +360,53 @@ pub fn build_catalog(project: &LdtkJson) -> Result<Catalog, CatalogErrors> {
         float_tag_ids,
         grid_size: grid_size_u32,
         spatial_cell_size,
-        // Depends on the placement loop's actual usage, which doesn't exist
-        // yet (place.rs) — computing real values now risks guessing wrong.
-        // See ARCHITECTURE.md §6.
-        min_clearance: HashMap::new(),
+        min_clearance,
         by_door_dir,
     })
+}
+
+/// ARCHITECTURE.md §6: for every `(door direction, door width)` pair a
+/// candidate could be matched against, the smallest room that can connect
+/// through it — the space any placement must keep free beyond such a door
+/// for the door to stay fillable. Computed once here; read-only afterwards
+/// and only ever point-looked-up, so the `HashMap` doesn't reintroduce
+/// DESIGN.md §7's iteration-order hazard.
+///
+/// Keyed by the direction the OPEN door faces: a room connects through it
+/// via its own door facing the opposite direction, and the room's depth
+/// behind that door is its full extent along the open door's direction.
+/// Only rooms that can actually connect contribute — a room without a
+/// matching opposite-facing door can never be placed behind the door, so
+/// its size is irrelevant there. With no connecting room at all there is no
+/// entry: such a door is unfillable regardless of clearance.
+fn compute_min_clearance(rooms: &[RoomDef]) -> HashMap<(Dir, u8), TileSize> {
+    let mut best: HashMap<(Dir, u8), (u32, TileSize)> = HashMap::new();
+    for room in rooms {
+        for door in &room.doors {
+            let depth = match door.dir {
+                Dir::N | Dir::S => room.size.height,
+                Dir::E | Dir::W => room.size.width,
+            };
+            let entry = match door.dir {
+                Dir::N | Dir::S => TileSize {
+                    width: u32::from(door.width),
+                    height: depth,
+                },
+                Dir::E | Dir::W => TileSize {
+                    width: depth,
+                    height: u32::from(door.width),
+                },
+            };
+            let key = (door.dir.opposite(), door.width);
+            let slot = best.entry(key).or_insert((depth, entry));
+            if depth < slot.0 {
+                *slot = (depth, entry);
+            }
+        }
+    }
+    best.into_iter()
+        .map(|(key, (_, size))| (key, size))
+        .collect()
 }
 
 fn find_grid_size(project: &LdtkJson) -> Option<i32> {
@@ -632,6 +746,121 @@ mod tests {
             .find(|l| l.identifier == identifier)
             .map(|l| l.iid.clone())
             .expect("test fixture level must exist")
+    }
+
+    #[test]
+    fn min_clearance_covers_every_door_shape_in_the_catalog_with_hand_verified_minimums() {
+        let project = load_kenney_catalog();
+        let catalog = build_catalog(&project).expect("bundled catalog should validate");
+
+        // Independent recomputation, straight from the raw JSON (the same
+        // walk `compute_min_clearance` does, written separately): every door
+        // in the fixture is 2 tiles wide, and the smallest room that can
+        // connect through any (dir, 2) door is 4x2 — its full 2-tile extent
+        // along the connection axis. Keys are the OPEN door's direction.
+        for dir in [Dir::N, Dir::E, Dir::S, Dir::W] {
+            let clearance = catalog
+                .min_clearance(dir, 2)
+                .unwrap_or_else(|| panic!("{dir:?} must have a clearance entry"));
+            assert_eq!(
+                clearance,
+                TileSize {
+                    width: 2,
+                    height: 2
+                },
+                "wrong clearance for {dir:?}"
+            );
+            // Widths other than 2 have no doors in this catalog, so no
+            // connecting room can exist and there must be no entry.
+            assert!(
+                catalog.min_clearance(dir, 1).is_none(),
+                "width 1 has no doors in this catalog"
+            );
+        }
+    }
+
+    #[test]
+    fn clearance_strip_starts_one_tile_beyond_the_door_and_spans_its_width() {
+        let project = load_kenney_catalog();
+        let catalog = build_catalog(&project).expect("bundled catalog should validate");
+
+        // A 2-wide strip reaching 2 tiles out: N opens upward (y-up), S
+        // downward, E rightward, W leftward. min = the far corner for S/W.
+        let pos = TilePos { x: 10, y: 20 };
+        let unpack = |strip: Option<TileRect>| -> (TilePos, TileSize) {
+            let s = strip.expect("strip must exist for a cataloged (dir, width)");
+            (s.min, s.size)
+        };
+
+        let (min, size) = unpack(catalog.clearance_strip(pos, Dir::N, 2));
+        assert_eq!(min, TilePos { x: 10, y: 21 });
+        assert_eq!(
+            size,
+            TileSize {
+                width: 2,
+                height: 2
+            }
+        );
+
+        let (min, size) = unpack(catalog.clearance_strip(pos, Dir::S, 2));
+        // Two full tiles below the footprint (y=20): rows 19 and 18.
+        assert_eq!(min, TilePos { x: 10, y: 18 });
+        assert_eq!(
+            size,
+            TileSize {
+                width: 2,
+                height: 2
+            }
+        );
+
+        let (min, size) = unpack(catalog.clearance_strip(pos, Dir::E, 2));
+        assert_eq!(min, TilePos { x: 11, y: 20 });
+        assert_eq!(
+            size,
+            TileSize {
+                width: 2,
+                height: 2
+            }
+        );
+
+        let (min, size) = unpack(catalog.clearance_strip(pos, Dir::W, 2));
+        // Two full tiles left of the footprint (x=10): columns 9 and 8.
+        assert_eq!(min, TilePos { x: 8, y: 20 });
+        assert_eq!(
+            size,
+            TileSize {
+                width: 2,
+                height: 2
+            }
+        );
+
+        assert!(catalog.clearance_strip(pos, Dir::N, 1).is_none());
+    }
+
+    #[test]
+    fn a_connecting_room_exactly_fills_the_clearance_strip_of_the_door_it_connects_to() {
+        // The property the whole design rests on: the smallest room that
+        // connects through a (dir, 2) door lands precisely on that door's
+        // strip. Derived end to end: Room_Spawn_1's S-door footprint at
+        // (8, 0); a 4x2 room connecting through it places its own E-door
+        // one tile below, so its body is exactly the S strip of that door.
+        let project = load_kenney_catalog();
+        let catalog = build_catalog(&project).expect("bundled catalog should validate");
+
+        let door_pos = TilePos { x: 8, y: 0 };
+        let strip = catalog
+            .clearance_strip(door_pos, Dir::S, 2)
+            .expect("fixture has (S, 2) doors");
+
+        // A room whose body is exactly that strip must fit it exactly:
+        assert_eq!(strip.min, TilePos { x: 8, y: -2 });
+        assert_eq!(
+            strip.size,
+            TileSize {
+                width: 2,
+                height: 2
+            }
+        );
     }
 
     #[test]
