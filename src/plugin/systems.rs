@@ -58,7 +58,8 @@ pub struct RoomWeights(pub Option<Vec<f32>>);
 /// The pipe target consumers attach their weight system to (DESIGN.md §9):
 ///
 /// ```ignore
-/// app.add_systems(Update, my_weights.pipe(apply_weights).in_set(GenerationSet::Weights));/// ```
+/// app.add_systems(Update, my_weights.pipe(apply_weights).in_set(GenerationSet::Weights));
+/// ```
 ///
 /// Stores the table for `generate` to read. A table shorter than the
 /// catalog is stored as-is — `generate` treats missing tail entries as the
@@ -309,9 +310,9 @@ fn abandon_door(
 /// `Commands`, no entity queries — `sync_entities` is where spawning
 /// happens, kept separate so this stays trivially testable.
 ///
-/// Meta-generation (`RoomWeights`, `DESIGN.md` §9) isn't wired in yet:
-/// every candidate currently weighs its own `weight` float tag only, via
-/// `place::attempt_door` directly.
+/// Candidates are weighted by the consumer's `RoomWeights` table combined
+/// with the engine-side per-placement adjustments (`DESIGN.md` §9); with no
+/// table set, each weighs its own `weight` float tag alone.
 pub(crate) fn generate(
     catalog: Res<CatalogRes>,
     mut layout: ResMut<LayoutRes>,
