@@ -120,10 +120,15 @@ impl Layout {
     }
 
     /// Commits one placement: assigns it a `PlacementId`, indexes it
-    /// spatially, closes whichever open doors `closes` names, and opens its
-    /// own doors in turn. `closes` are `OpenDoorId`s the caller has already
-    /// matched against this placement's door positions — this method does
-    /// no position math itself, only bookkeeping.
+    /// spatially, closes the open doors `connections` names, and opens the
+    /// new room's remaining doors. `connections` pairs each of the new
+    /// room's own door indices with the `OpenDoorId` it satisfies — both
+    /// sides are handled here so a connected doorway never becomes a
+    /// frontier door: closing the existing side but opening the new side
+    /// would leave a door whose clearance strip lies inside its neighbour
+    /// (it was just connected through), unffillable by any candidate.
+    /// This method does no position math itself, only bookkeeping; the
+    /// matching is `place.rs`'s `door_connections`.
     ///
     /// `None` only if `room` isn't in `catalog` — meaning the caller passed
     /// a `RoomId` from a different `Catalog`, which shouldn't happen given
@@ -134,7 +139,7 @@ impl Layout {
         catalog: &Catalog,
         room: RoomId,
         origin: TilePos,
-        closes: &[OpenDoorId],
+        connections: &[(usize, OpenDoorId)],
     ) -> Option<PlacementId> {
         let def = catalog.get(room)?;
 
@@ -151,11 +156,14 @@ impl Layout {
         };
         index.insert(rect, id);
 
-        for &close in closes {
-            self.close_door(close);
+        for (_, close) in connections {
+            self.close_door(*close);
         }
 
         for (i, _door) in def.doors.iter().enumerate() {
+            if connections.iter().any(|(satisfied, _)| *satisfied == i) {
+                continue;
+            }
             let door_index = u8::try_from(i).unwrap_or(u8::MAX);
             self.open_door(OpenDoor {
                 placement: id,
@@ -253,21 +261,29 @@ mod tests {
             .expect("a room with at least one door has at least one open door");
 
         let second = layout
-            .commit(&catalog, room, TilePos { x: 1000, y: 1000 }, &[closing])
+            .commit(
+                &catalog,
+                room,
+                TilePos { x: 1000, y: 1000 },
+                &[(0, closing)],
+            )
             .expect("second commit must succeed");
         assert_ne!(first, second);
         assert_eq!(layout.placed_count(), 2);
-        // One door closed by `closes`, `door_count` more opened by the
-        // second placement — net change is `door_count - 1`.
-        assert_eq!(layout.open_doors().count(), door_count * 2 - 1);
+        // One door closed by `connections` — on BOTH sides: the existing
+        // door named there, and this placement's own door 0, which the
+        // connection marks satisfied and so must not become a frontier
+        // door. Net change is `2 * (door_count - 1)`: each room contributes
+        // every door except the one consumed by the connection.
+        assert_eq!(layout.open_doors().count(), door_count * 2 - 2);
         assert!(
             layout.open_doors().all(|(id, _)| id != closing),
-            "the door named in `closes` must no longer be open"
+            "the door named in `connections` must no longer be open"
         );
 
         // Closing it again is a no-op, not a panic or a double-decrement.
         assert!(layout.close_door(closing).is_none());
-        assert_eq!(layout.open_doors().count(), door_count * 2 - 1);
+        assert_eq!(layout.open_doors().count(), door_count * 2 - 2);
 
         assert_eq!(layout.room_at(&catalog, TilePos { x: 0, y: 0 }), Some(room));
         assert_eq!(

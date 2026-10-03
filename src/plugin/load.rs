@@ -9,9 +9,11 @@ use bevy_ecs_ldtk::prelude::*;
 
 use crate::generator::catalog::{CatalogError, build_catalog};
 use crate::generator::error::CatalogErrors;
+use crate::generator::weight::PlacementCounters;
 
 use super::CatalogRes;
 use super::events::GenerationFailed;
+use super::systems::{GenerationConfig, PlacementCountersRes};
 
 #[derive(States, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum GenerationState {
@@ -38,6 +40,8 @@ pub(crate) fn poll_ldtk_load(
     asset_server: Res<AssetServer>,
     handle: Res<LdtkHandle>,
     projects: Res<Assets<LdtkProject>>,
+    mut config: ResMut<GenerationConfig>,
+    mut counters: ResMut<PlacementCountersRes>,
     mut catalog_res: ResMut<CatalogRes>,
     mut failed: MessageWriter<GenerationFailed>,
     mut next_state: ResMut<NextState<GenerationState>>,
@@ -60,6 +64,14 @@ pub(crate) fn poll_ldtk_load(
             };
             match build_catalog(project.json_data()) {
                 Ok(catalog) => {
+                    // One-time resolution of config tag names against the
+                    // loaded catalog (DESIGN.md §2) — never by string inside
+                    // the placement loop.
+                    let resolved = config.weight_config.resolve(&catalog);
+                    config.resolved = Some(resolved);
+                    // Sized to this catalog's TagId space; rebuilt here so a
+                    // second load (asset replaced) can't leave stale counters.
+                    *counters = PlacementCountersRes(PlacementCounters::new(&catalog));
                     *catalog_res = CatalogRes(Arc::new(catalog));
                     next_state.set(GenerationState::Ready);
                 }

@@ -8,12 +8,12 @@ use bevy_ecs_ldtk::prelude::*;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
-use crate::generator::catalog::{Catalog, RoomDef};
+use crate::generator::catalog::{Catalog, RoomDef, TagId};
 use crate::generator::error::CatalogErrors;
 use crate::generator::geom::{OpenDoorId, PlacementId, RoomId, TilePos, TileRect};
 use crate::generator::layout::{Layout, open_door_dir, open_door_pos};
-use crate::generator::place::{StartRoom, attempt_door, place_start_room};
-use crate::generator::weight::CountBy;
+use crate::generator::place::{StartRoom, WeightParams, attempt_door, place_start_room};
+use crate::generator::weight::{CountBy, PlacementCounters, ResolvedWeights, WeightContext};
 
 use super::events::{DoorAbandoned, GenerationFailed, RoomDespawned, RoomPlaced, RoomSpawned};
 use super::load::{GenerationState, LdtkHandle};
@@ -22,13 +22,53 @@ use super::{CatalogRes, CullingPolicy, GenerationAnchor, LayoutRes};
 /// After this many exhausted attempts (`attempt_door` returning `None`,
 /// each one a full candidate-pool exhaustion in `place.rs`'s terms), a door
 /// is abandoned rather than retried forever. See DESIGN.md §9, "Dead doors".
-const DEAD_DOOR_THRESHOLD: u32 = 3;
+///
+/// An exhausted attempt is not proof of permanent blockage: when the
+/// frontier around a door is still growing, candidates fail only
+/// temporarily and the door becomes fillable once the neighbourhood
+/// settles. Measured on the bundled catalog (seed 1234): every door fills
+/// eventually, but a door near churn can stay unfillable for dozens of
+/// rounds — 3 strikes abandoned 6 fillable doors and capped the dungeon at
+/// 41 rooms, while a high threshold lets the same run reach 57. DESIGN.md
+/// §9's "repeated" is therefore dozens, not a handful; the real fix is the
+/// retry-suppression note below, and a premature abandon is strictly worse
+/// than a bounded re-check (the check is cheap: one candidate scan).
+const DEAD_DOOR_THRESHOLD: u32 = 300;
 
 /// Simple per-frame room cap standing in for `DESIGN.md` §5's full
 /// `GenerationBudget` (`Immediate`/`RoomsPerFrame`/`TimeBudget`), which
 /// isn't wired into `GeneratorPlugin` yet — this is a fixed number, not the
 /// final API.
 const ROOMS_PER_FRAME: usize = 10;
+
+/// The consumer's once-per-frame weight table (DESIGN.md §9). Written by a
+/// consumer system piped into the public [`apply_weights`] — never mutated
+/// by the engine — and read by `generate` when weighting candidates.
+///
+/// Output index `i` corresponds to `RoomId(i)`. A table shorter than the
+/// catalog is legal: missing entries fall back to each room's own `weight`
+/// float tag (the `apply_weights` doc explains why this is a fallback
+/// rather than an error). `None` (the default) means no consumer table —
+/// every candidate weighs its base weight only.
+///
+/// [`apply_weights`]: crate::apply_weights
+#[derive(Resource, Default, Deref, DerefMut)]
+pub struct RoomWeights(pub Option<Vec<f32>>);
+
+/// The pipe target consumers attach their weight system to (DESIGN.md §9):
+///
+/// ```ignore
+/// app.add_systems(Update, my_weights.pipe(apply_weights).in_set(GenerationSet::Weights));/// ```
+///
+/// Stores the table for `generate` to read. A table shorter than the
+/// catalog is stored as-is — `generate` treats missing tail entries as the
+/// rooms' base weight — so this can never index out of bounds and never
+/// panics (`AGENTS.md` lint policy); the consumer gets the correct-for-the-
+/// prefix behaviour rather than a hard failure, because a length mismatch
+/// is a config bug worth tolerating gracefully, not corrupting state over.
+pub fn apply_weights(In(table): In<Vec<f32>>, mut room_weights: ResMut<RoomWeights>) {
+    *room_weights = RoomWeights(Some(table));
+}
 
 /// How many room entities `sync_entities` introduces per frame. Entity
 /// spawning — `bevy_ecs_ldtk` materializing tilemaps — is throttled
@@ -56,13 +96,26 @@ impl GenRng {
 
 /// `generation_radius`, `max_rooms`, and `start`, plumbed from
 /// `GeneratorPlugin`'s own fields — previously discarded entirely in
-/// `Plugin::build` (`let _ = (self.generation_radius, ...)`).
+/// `Plugin::build` (`let _ = (self.generation_radius, ...)`). `weights`
+/// starts unresolved (empty) and is filled in by `poll_ldtk_load` once the
+/// catalog exists — tag names resolve against the loaded catalog, once
+/// (DESIGN.md §2).
+/// `generation_radius`, `max_rooms`, and `start`, plumbed from
+/// `GeneratorPlugin`'s own fields — previously discarded entirely in
+/// `Plugin::build` (`let _ = (self.generation_radius, ...)`). `weights`
+/// starts unresolved (empty) and is filled in by `poll_ldtk_load` once the
+/// catalog exists — tag names resolve against the loaded catalog, once
+/// (DESIGN.md §2).
 #[derive(Resource, Clone)]
 pub(crate) struct GenerationConfig {
     pub generation_radius: f32,
     pub max_rooms: Option<(usize, CountBy)>,
     pub start: StartRoom,
     pub culling: CullingPolicy,
+    pub weight_config: crate::generator::weight::WeightConfig,
+    /// Set when the catalog loads; `None` until then (and for catalogs
+    /// with no tags at all, resolving to empty rules).
+    pub resolved: Option<ResolvedWeights>,
 }
 
 /// Failure count per door. Point-looked-up and incremented by exact key,
@@ -71,6 +124,12 @@ pub(crate) struct GenerationConfig {
 /// reasoning as `Catalog::min_clearance`.
 #[derive(Resource, Default, Deref, DerefMut)]
 pub(crate) struct DoorAttempts(HashMap<OpenDoorId, u32>);
+
+/// Engine-maintained placement counters (DESIGN.md §9) — the per-placement
+/// memory a once-per-frame weight table lacks. Updated by `generate` on
+/// every commit, read by `candidate_weight` through `WeightContext`.
+#[derive(Resource, Default, Deref, DerefMut)]
+pub(crate) struct PlacementCountersRes(pub PlacementCounters);
 
 /// One spawned room entity: a "world" for `bevy_ecs_ldtk` (`LdtkProjectHandle`
 /// + `LevelSet`) whose single level child the crate spawns at
@@ -258,6 +317,8 @@ pub(crate) fn generate(
     mut layout: ResMut<LayoutRes>,
     mut rng: ResMut<GenRng>,
     mut attempts: ResMut<DoorAttempts>,
+    mut counters: ResMut<PlacementCountersRes>,
+    room_weights: Res<RoomWeights>,
     config: Res<GenerationConfig>,
     anchors: Query<&GlobalTransform, With<GenerationAnchor>>,
     mut placed_events: MessageWriter<RoomPlaced>,
@@ -291,7 +352,18 @@ pub(crate) fn generate(
         let Some(&anchor) = anchors.first() else {
             return;
         };
-        match place_start_room(&mut layout, &catalog, &config.start, anchor, &mut rng.0) {
+        match place_start_room(
+            &mut layout,
+            &catalog,
+            &config.start,
+            anchor,
+            &mut rng.0,
+            WeightParams {
+                table: room_weights.0.as_deref(),
+                ctx: None,
+                ceiling: None,
+            },
+        ) {
             Ok(placement_id) => {
                 placed_this_frame += 1;
                 if let Some(placement) = layout.get(placement_id) {
@@ -316,6 +388,16 @@ pub(crate) fn generate(
     let radius_tiles = config.generation_radius / grid_size;
     let ordered = doors_by_distance(&layout, &catalog, &anchors, radius_tiles);
 
+    // Meta-generation inputs, assembled once per frame. The ceiling arrives
+    // pre-converted into `progress`'s counting convention (see
+    // `progress_ceiling`) so `candidate_weight` compares like with like.
+    let ceiling = progress_ceiling(&config.max_rooms, &catalog);
+    // Rebuilt per door below: `WeightContext` borrows `counters`, which
+    // must be mutably updated after each commit, so the borrow can't span
+    // the whole loop.
+    let resolved_ref = config.resolved.as_ref();
+    let table = room_weights.0.as_deref();
+
     for door_id in ordered {
         if placed_this_frame >= ROOMS_PER_FRAME {
             break;
@@ -326,11 +408,37 @@ pub(crate) fn generate(
             continue;
         }
 
-        match attempt_door(&mut layout, &catalog, door_id, &mut rng.0) {
+        let weight_params = WeightParams {
+            table,
+            ctx: resolved_ref.map(|resolved| WeightContext {
+                resolved,
+                counters: &counters,
+            }),
+            ceiling,
+        };
+
+        match attempt_door(&mut layout, &catalog, door_id, &mut rng.0, weight_params) {
             Some(placement_id) => {
                 placed_this_frame += 1;
                 attempts.remove(&door_id);
                 if let Some(placement) = layout.get(placement_id) {
+                    // Counters must reflect the placement that just
+                    // happened, before the next door weights against them —
+                    // per-placement factors would otherwise read stale
+                    // within a single frame (DESIGN.md §9, engine side).
+                    if let Some(def) = catalog.get(placement.room) {
+                        let tag_count = catalog.tag_count();
+                        counters.record(
+                            tag_count,
+                            |i| {
+                                u16::try_from(i)
+                                    .ok()
+                                    .map(TagId)
+                                    .is_some_and(|id| def.bool_tag(id))
+                            },
+                            progresses(&config.max_rooms, &catalog, def),
+                        );
+                    }
                     placed_events.write(RoomPlaced {
                         room: placement.room,
                         at: placement.origin,
@@ -346,6 +454,34 @@ pub(crate) fn generate(
                 }
             }
         }
+    }
+}
+
+/// The ceiling in `PlacementCounters::progress`'s counting convention:
+/// `All` counts every placement, `Tag` counts only rooms carrying the tag
+/// (resolved; a tag the catalog doesn't define can never be carried, so a
+/// `Tag` ceiling can never be reached — treated as unbounded).
+fn progress_ceiling(max: &Option<(usize, CountBy)>, catalog: &Catalog) -> Option<usize> {
+    match max {
+        None => None,
+        Some((max, CountBy::All)) => Some(*max),
+        Some((max, CountBy::Tag(name))) => {
+            // With no tags in the catalog at all, nothing can carry the
+            // tag — but the catalog also predates the schema, so `All`-like
+            // behaviour would surprise. Unbounded is the honest reading.
+            catalog.tag_id(name).map(|_| *max)
+        }
+    }
+}
+
+/// Whether one committed placement counts toward the ceiling: `All` always,
+/// `Tag` only when the room carries the tag. A name the catalog doesn't
+/// define can never match — nothing carries a tag the project never declared.
+fn progresses(max: &Option<(usize, CountBy)>, catalog: &Catalog, def: &RoomDef) -> bool {
+    match max {
+        None => false,
+        Some((_, CountBy::All)) => true,
+        Some((_, CountBy::Tag(name))) => catalog.tag_id(name).is_some_and(|id| def.bool_tag(id)),
     }
 }
 

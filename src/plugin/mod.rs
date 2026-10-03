@@ -19,7 +19,8 @@ pub use events::{
 };
 pub use load::GenerationState;
 use load::LdtkHandle;
-use systems::{DoorAttempts, GenRng, GenerationConfig};
+use systems::{DoorAttempts, GenRng, GenerationConfig, PlacementCountersRes};
+pub use systems::{RoomWeights, apply_weights};
 
 #[derive(Resource, Debug, Clone, Default, Deref, DerefMut)]
 pub struct CatalogRes(pub Arc<Catalog>);
@@ -70,6 +71,7 @@ pub struct GeneratorPlugin {
     max_rooms: Option<(usize, CountBy)>,
     start: StartRoom,
     culling: CullingPolicy,
+    weight_config: crate::generator::weight::WeightConfig,
 }
 
 impl GeneratorPlugin {
@@ -81,6 +83,7 @@ impl GeneratorPlugin {
             max_rooms: None,
             start: StartRoom::default(),
             culling: CullingPolicy::Radius(generation_radius * 2.0),
+            weight_config: Default::default(),
         }
     }
 
@@ -95,6 +98,7 @@ impl GeneratorPlugin {
             max_rooms: None,
             start: StartRoom::default(),
             culling: CullingPolicy::Radius(generation_radius * 2.0),
+            weight_config: Default::default(),
         }
     }
 
@@ -123,6 +127,15 @@ impl GeneratorPlugin {
         self.culling = culling;
         self
     }
+
+    /// Meta-generation configuration (DESIGN.md §9): closure ceiling,
+    /// per-tag quotas and depth gates, multi-door preference. Tag names
+    /// resolve once against the loaded catalog. Defaults to inert — every
+    /// room weighs its own `weight` float tag only.
+    pub fn with_weight_config(mut self, config: crate::generator::weight::WeightConfig) -> Self {
+        self.weight_config = config;
+        self
+    }
 }
 
 impl Plugin for GeneratorPlugin {
@@ -143,8 +156,12 @@ impl Plugin for GeneratorPlugin {
                 max_rooms: self.max_rooms.clone(),
                 start: self.start.clone(),
                 culling: self.culling,
+                weight_config: self.weight_config.clone(),
+                resolved: None,
             })
+            .init_resource::<RoomWeights>()
             .init_resource::<DoorAttempts>()
+            .init_resource::<PlacementCountersRes>()
             .init_resource::<CatalogRes>()
             .init_resource::<LayoutRes>()
             .init_state::<GenerationState>()

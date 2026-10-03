@@ -150,6 +150,12 @@ fn streaming_generation_runs_end_to_end() {
         observed.failed, 0,
         "nothing should fail on the bundled catalog"
     );
+    assert_eq!(
+        observed.abandoned, 0,
+        "no door should be abandoned on the bundled catalog — abandoned doors are \
+         the dead-door path firing (DESIGN.md §9), i.e. doors the validity checks \
+         could never fill"
+    );
 
     let layout = app.world().resource::<LayoutRes>();
     assert!(
@@ -188,5 +194,63 @@ fn streaming_generation_runs_end_to_end() {
     assert_eq!(
         origin_room, here,
         "the moved anchor's tile and the start tile should still be the same room"
+    );
+
+    // Layout invariants over the whole streamed dungeon (same assertions as
+    // generator/place.rs's streamed test, but against everything the real
+    // plugin produced across 300 frames):
+    //   1. footprints pairwise disjoint — no room was ever placed on
+    //      another;
+    //   2. every open door's clearance strip is unoccupied — no placement
+    //      sealed a door shut, and no room was born with a door opening
+    //      into another room's interior.
+    let placements: Vec<(RoomId, TilePos)> =
+        layout.iter().map(|(_, p)| (p.room, p.origin)).collect();
+    for (i, &(room_a, origin_a)) in placements.iter().enumerate() {
+        let def_a = catalog.get(room_a).expect("placed room must exist");
+        let rect_a = TileRect {
+            min: origin_a,
+            size: def_a.size,
+        };
+        for &(room_b, origin_b) in placements.iter().skip(i + 1) {
+            let def_b = catalog.get(room_b).expect("placed room must exist");
+            let rect_b = TileRect {
+                min: origin_b,
+                size: def_b.size,
+            };
+            assert!(
+                !overlaps(rect_a, rect_b),
+                "rooms must never overlap: {rect_a:?} vs {rect_b:?}"
+            );
+        }
+    }
+
+    let mut open_doors = 0;
+    for (_, open) in layout.open_doors().collect::<Vec<_>>() {
+        let pos = open_door_pos(layout, catalog, *open).expect("open door of a live placement");
+        let placement = layout.get(open.placement).expect("live placement");
+        let def = catalog.get(placement.room).expect("live room");
+        let door = def.doors.get(open.door as usize).expect("live door");
+        let Some(strip) = catalog.clearance_strip(pos, door.dir, door.width) else {
+            continue;
+        };
+        open_doors += 1;
+        for (_, other) in layout.iter() {
+            let other_def = catalog.get(other.room).expect("placed room");
+            assert!(
+                !overlaps(
+                    strip,
+                    TileRect {
+                        min: other.origin,
+                        size: other_def.size,
+                    },
+                ),
+                "open door's clearance strip at {pos:?} is occupied — the door was sealed"
+            );
+        }
+    }
+    assert!(
+        open_doors > 0,
+        "a streaming dungeon must still have open doors ahead of the anchor"
     );
 }
