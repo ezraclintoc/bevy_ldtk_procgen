@@ -21,6 +21,10 @@ use bevy_ldtk_procgen::prelude::*;
 mod common;
 
 fn main() {
+    // Fixed seed so the demo is the same dungeon every run — reproducible
+    // layouts are the crate's main debugging affordance. R rerolls from a
+    // random seed; pass a different `with_seed` to pin a new one.
+    info!("minimal: seed 1234 — press R for a fresh dungeon");
     // No `insert_resource(LdtkSettings { .. })` here: GeneratorPlugin enforces
     // `UseWorldTranslation` and `load_level_neighbors: false` itself. See
     // ARCHITECTURE.md §2.

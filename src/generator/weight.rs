@@ -22,7 +22,12 @@ use super::geom::RoomId;
 /// different answers against a hallway-heavy catalog.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CountBy {
+    /// Every placement counts, hallways included.
     All,
+    /// Only placements carrying this bool tag count. A hallway is a placement
+    /// too, so `All` and `Tag("room")` answer very differently on a
+    /// hallway-heavy catalog — which is why this is configuration and not a
+    /// constant (`DESIGN.md` §9).
     Tag(String),
 }
 

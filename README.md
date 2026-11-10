@@ -20,17 +20,28 @@ non-linear layout at runtime — no hand-authored dungeon required.
 
 ### Implemented
 
-_Nothing yet — the generator is being rewritten from scratch on this branch._
+- Catalog built from an LDtk project: rooms, doors (direction from the level
+  edge, any width the art uses), bool and float tags, per-room weights.
+- Synchronous, seed-reproducible generation in a per-frame budget, with the
+  layout as the single source of truth.
+- Door-to-door placement with clearance-strip validation, so a door can never
+  be sealed or born facing another room's interior.
+- Streaming: rooms spawn near a `GenerationAnchor` and are culled behind it
+  without ever mutating the layout.
+- Meta-generation: a consumer weight table plus engine-side quotas, depth
+  gates, closure bias and multi-door preference.
+- Regeneration on demand (`Regenerate`), with an optional fixed seed.
+- Point → room queries, connectivity via open doors, and events for every
+  placement, spawn, despawn, abandoned door and catalog failure.
 
 ### Planned
 
-- Procedural Room Generation
-- Asynchronous Generation
-- Spatial Hashing
-- Support for variable door widths
-- Culling
-- Saving and loading
-- Deterministic Seeding
+- Tile-size coverage beyond 16px in the examples (the crate itself is
+  grid-agnostic; the 18px and 512px catalogs are test-only today).
+- `GenerationBudget` configuration (currently a fixed per-frame room cap).
+- Tag transition table wiring (`WeightConfig::tag_transition`).
+- Saving and loading a layout.
+- Hot reload of the `.ldtk` project.
 
 ## Installation
 

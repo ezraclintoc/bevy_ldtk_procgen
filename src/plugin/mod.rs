@@ -22,17 +22,31 @@ pub use load::GenerationState;
 use systems::{DoorAttempts, GenRng, GenerationConfig, PlacementCountersRes};
 pub use systems::{RoomWeights, apply_weights};
 
+/// The loaded catalog, behind an `Arc` so it is cheap to share and impossible
+/// to mutate accidentally (`DESIGN.md` §1: immutable after load).
 #[derive(Resource, Debug, Clone, Default, Deref, DerefMut)]
 pub struct CatalogRes(pub Arc<Catalog>);
 
+/// The generator's output: which rooms were placed where (`DESIGN.md` §1).
+///
+/// Append-only and never touched by culling — spawned entities are a cache
+/// over this, which is what makes revisiting an area reproduce it exactly.
 #[derive(Resource, Debug, Clone, Default, Deref, DerefMut)]
 pub struct LayoutRes(pub Layout);
 
+/// Generation follows entities carrying this (`DESIGN.md` §3).
+///
+/// There is no camera fallback on purpose: attach it to a player, a camera, or
+/// a scripted focus point, and generation follows whichever you chose.
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct GenerationAnchor;
 
+/// The one scheduling seam that is public API (`DESIGN.md` §9).
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenerationSet {
+    /// Where a consumer's weight-table system belongs. Adding it to this set
+    /// is what orders it before generation, instead of leaving two writers of
+    /// `RoomWeights` to race in an unspecified order.
     Weights,
 }
 
@@ -77,6 +91,16 @@ pub(crate) enum ProjectSource {
 #[derive(Resource)]
 pub(crate) struct ProjectSourceRes(pub ProjectSource);
 
+/// The whole library as one plugin: load a project, build a catalog, and keep
+/// placing rooms around whatever carries [`GenerationAnchor`].
+///
+/// Configuration is the builder methods below; everything else a consumer
+/// needs is a resource (`CatalogRes`, `LayoutRes`, [`RoomWeights`]) or a
+/// message (the types in `events`).
+///
+/// Requires `LdtkPlugin` and an asset pipeline (`DefaultPlugins`); it no
+/// longer requires them to be added *before* it, and reports their absence
+/// rather than panicking.
 pub struct GeneratorPlugin {
     source: ProjectSource,
     generation_radius: f32,
@@ -88,6 +112,12 @@ pub struct GeneratorPlugin {
 }
 
 impl GeneratorPlugin {
+    /// Load the project at `path` (relative to the asset root) and keep
+    /// rooms spawned within `generation_radius` pixels of an anchor.
+    ///
+    /// Doors are only filled within that radius, which is what bounds the
+    /// work per frame and keeps the dungeon streaming rather than generating
+    /// a whole level up front (`DESIGN.md` §3).
     pub fn new(path: impl Into<String>, generation_radius: f32) -> Self {
         Self {
             source: ProjectSource::Path(path.into()),
@@ -115,11 +145,18 @@ impl GeneratorPlugin {
         }
     }
 
+    /// Fix the RNG seed, making the dungeon reproducible run to run — the
+    /// highest-value debugging affordance the library has (`DESIGN.md` §3).
+    /// Defaults to a random seed.
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
         self
     }
 
+    /// Stop generating once `max` placements of the `by` kind exist — a
+    /// ceiling, not a target: closure bias steers the frontier into caps as it
+    /// approaches, so the dungeon finishes instead of truncating mid-run
+    /// (`DESIGN.md` §9).
     pub fn with_max_rooms(mut self, max: usize, by: CountBy) -> Self {
         self.max_rooms = Some((max, by));
         self

@@ -16,15 +16,26 @@ use super::events::GenerationFailed;
 use super::systems::{GenerationConfig, PlacementCountersRes};
 use super::{ProjectSource, ProjectSourceRes};
 
+/// Where the plugin is in its own lifecycle (`DESIGN.md` §4).
+///
+/// A Bevy state rather than a queue of flags: consumers gate their own systems
+/// on it (`run_if(in_state(GenerationState::Ready))`) instead of checking
+/// whether some resource happens to be populated yet.
 #[derive(States, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum GenerationState {
+    /// Waiting for the `.ldtk` to load and its catalog to build. Also where
+    /// the plugin stays if no asset pipeline exists at all.
     #[default]
     Loading,
     /// Reserved for an in-progress first placement batch once `place.rs`
     /// exists. `build_catalog` is synchronous and fast, so nothing currently
     /// spends a frame in this state — `Loading` goes straight to `Ready`.
     Building,
+    /// Catalog built, generation running. Placement itself is continuous, so
+    /// there is no "finished"; an idle dungeon is still `Ready`.
     Ready,
+    /// The catalog was rejected, or `StartRoom` matched nothing. Terminal: the
+    /// details are in `GenerationFailed`, and nothing will be placed.
     Failed,
 }
 

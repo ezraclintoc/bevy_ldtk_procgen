@@ -65,6 +65,10 @@ const PLAYER_HALF_EXTENT: f32 = 6.0;
 const PLAYER_Z: f32 = 30.0;
 
 fn main() {
+    // Fixed seed so the room you start in, and the first few doors, are the
+    // same on every run — useful when checking collision or visibility against
+    // known geometry. R rerolls from a random seed.
+    info!("full: seed 424242 — press R for a fresh dungeon");
     App::new()
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
         .add_plugins(LdtkPlugin)

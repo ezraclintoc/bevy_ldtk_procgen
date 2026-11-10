@@ -25,33 +25,70 @@ use bevy_ecs_ldtk::ldtk::{
 use super::error::CatalogErrors;
 use super::geom::{Dir, PixelPos, RoomId, TilePos, TileRect, TileSize};
 
+/// Everything that can make a catalog fail to build, or generation to fail to
+/// start. This enum is the replacement for the old implementation's panics
+/// (`DESIGN.md` §6): every case that *has* a name in the project names it,
+/// because "invalid room" without a name is not actionable.
+///
+/// `#[non_exhaustive]`: a consumer matching on this gets a compile error when
+/// a variant is added, rather than silently mishandling a case it never saw.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum CatalogError {
+    /// The project produced no rooms at all — no levels, or levels whose
+    /// `layerInstances` are absent (LDtk's separate-level-files mode, which
+    /// the authoring contract does not cover yet).
     EmptyCatalog,
+    /// `StartRoom` asked for a constraint nothing satisfies. Conditional by
+    /// design (`DESIGN.md` §2): silence unless a constraint was requested.
     NoStartRoomMatched {
+        /// The constraint as it was asked for, so the message says *what*
+        /// had no match rather than just that something didn't.
         constraint: String,
     },
+    /// A layer's grid disagrees with the project grid — every door on that
+    /// layer would be placed at the wrong pitch.
     MixedGridSize {
+        /// The offending level.
         level: String,
+        /// Project-wide grid size, in pixels.
         expected: i32,
+        /// The layer's own grid size, in pixels.
         found: i32,
     },
+    /// A level's size isn't a whole number of tiles, so its footprint has no
+    /// exact integer representation and rooms would not tile.
     LevelNotTileAligned {
+        /// The offending level.
         level: String,
     },
+    /// The level has no entity layer, so there is no layer doors could
+    /// possibly be on.
     DoorLayerMissing {
+        /// The offending level.
         level: String,
     },
+    /// A `Door` entity touches no level edge. Direction comes from the edge
+    /// it sits on (`DESIGN.md` §2), so a door that touches none cannot be
+    /// oriented — and inferring it from the entity's size is exactly the old
+    /// `entity.width != 16` bug (`AGENTS.md`, invariants).
     DoorNotOnEdge {
+        /// The offending level.
         level: String,
+        /// The door's grid position, in LDtk's y-down frame.
         at: TilePos,
     },
+    /// Two levels share an `iid`. Instance handles are `LevelSet`s of iids,
+    /// so a duplicate makes one of the two unaddressable.
     DuplicateLevelIid {
+        /// The repeated iid.
         iid: String,
     },
-    /// Warning under `Lenient`, not necessarily fatal under `Strict`.
+    /// No single-door room faces this direction, so a corridor run in it can
+    /// never be terminated cleanly. Warning under `Lenient`, not necessarily
+    /// fatal under `Strict`.
     NoCapRoomForDirection {
+        /// The direction with no cap room.
         dir: Dir,
     },
     /// Grid size must be a positive integer — zero would make every
@@ -59,6 +96,8 @@ pub enum CatalogError {
     /// policy (`AGENTS.md`, lint policy) rules out as a code path entirely,
     /// so this is checked and reported instead of ever being reached.
     InvalidGridSize {
+        /// What the project declared — zero or negative, either of which would
+        /// make every tile-alignment check divide by zero.
         found: i32,
     },
     /// Not a `build_catalog` output — the `.ldtk` asset itself failed to
@@ -68,6 +107,8 @@ pub enum CatalogError {
     /// failure surface DESIGN.md §4 defines, and this still needs to reach
     /// it.
     AssetLoadFailed {
+        /// The asset system's own error, verbatim — it knows more about why
+        /// the load failed than this crate can.
         message: String,
     },
 }
@@ -83,17 +124,23 @@ pub struct DoorDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TagId(pub(crate) u16);
 
+/// Interned float tag id — an index into each room's float tag vector, minted
+/// only by the catalog. Like `TagId`, never a name: names are resolved once at
+/// catalog build (`DESIGN.md` §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FloatTagId(pub(crate) u16);
 
 /// Tag values are stored densely, indexed by ordinal — not a `HashMap`.
 #[derive(Debug, Clone)]
 pub struct RoomDef {
+    /// LDtk's instance id for the level — what an instance handle needs.
     pub iid: String,
     /// The level's LDtk identifier — what `StartRoom::Named` matches on
     /// (DESIGN.md §2, "Starting room").
     pub identifier: String,
+    /// The level's size in TILES — the placement footprint.
     pub size: TileSize,
+    /// Doors in LDtk's own order, which is the order `OpenDoor::door` indexes.
     pub doors: Vec<DoorDef>,
     /// Integration-only: read by `plugin/systems.rs`, never by placement code.
     pub world_offset_px: PixelPos,
@@ -102,10 +149,15 @@ pub struct RoomDef {
 }
 
 impl RoomDef {
+    /// A bool tag's value; `false` for a tag this room doesn't carry (and for
+    /// an id from a catalog that never declared it).
     pub fn bool_tag(&self, id: TagId) -> bool {
         self.bool_tags.get(id.0 as usize).copied().unwrap_or(false)
     }
 
+    /// A float tag's value; `0.0` when absent — the one deliberate exception
+    /// is a room's base selection weight, which defaults to `1.0` at the
+    /// sampling site, not here (`DESIGN.md` §2).
     pub fn float_tag(&self, id: FloatTagId) -> f32 {
         self.float_tags.get(id.0 as usize).copied().unwrap_or(0.0)
     }
@@ -140,6 +192,10 @@ impl RoomDef {
     }
 }
 
+/// Every room definition parsed from the project, plus the derived indices
+/// placement reads (`DESIGN.md` §1). Immutable after load: nothing here is
+/// ever mutated during generation, which is what makes a seed reproduce the
+/// same dungeon regardless of what was visited or culled.
 #[derive(Debug, Clone, Default)]
 pub struct Catalog {
     rooms: Vec<RoomDef>,
@@ -165,6 +221,10 @@ pub struct Catalog {
 }
 
 impl Catalog {
+    /// The definition a `RoomId` refers to. `RoomId`s can only be minted here,
+    /// so the `None` branch is unreachable for honestly-obtained ids — it
+    /// exists because indexing is denied (`AGENTS.md`, lint policy), not
+    /// because callers have to handle it.
     pub fn get(&self, id: RoomId) -> Option<&RoomDef> {
         self.rooms.get(id.0 as usize)
     }
@@ -179,14 +239,20 @@ impl Catalog {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Resolve a bool tag name — setup-time only, never inside the placement
+    /// loop (`DESIGN.md` §2). `None` means the project never declared it.
     pub fn tag_id(&self, name: &str) -> Option<TagId> {
         self.bool_tag_ids.get(name).copied()
     }
 
+    /// Resolve a float tag name, same rule as [`Catalog::tag_id`].
     pub fn float_tag_id(&self, name: &str) -> Option<FloatTagId> {
         self.float_tag_ids.get(name).copied()
     }
 
+    /// The smallest depth any room that can connect through a `(dir, width)`
+    /// door needs behind it (`ARCHITECTURE.md` §6). `None` when no room in the
+    /// catalog can connect through one — such a door is unfillable anyway.
     pub fn min_clearance(&self, dir: Dir, width: u8) -> Option<TileSize> {
         self.min_clearance.get(&(dir, width)).copied()
     }
@@ -227,6 +293,9 @@ impl Catalog {
         Some(TileRect { min, size })
     }
 
+    /// Pixels per tile, read once from the project — the only tile-size value
+    /// in the crate, and the reason nothing has to assume 16 (`ARCHITECTURE.md`
+    /// §2).
     pub fn grid_size(&self) -> u32 {
         self.grid_size
     }
@@ -244,14 +313,21 @@ impl Catalog {
         self.spatial_cell_size
     }
 
+    /// How many rooms the catalog holds — the length a `RoomWeights` table
+    /// should be, and the size of the `RoomId` space.
     pub fn len(&self) -> usize {
         self.rooms.len()
     }
 
+    /// Whether the catalog holds no rooms. Cannot happen for a catalog built
+    /// successfully (`EmptyCatalog` is an error), so this exists for
+    /// completeness of the `len`/`is_empty` pair.
     pub fn is_empty(&self) -> bool {
         self.rooms.is_empty()
     }
 
+    /// Rooms in `RoomId` order — entry `i` is `RoomId(i)`, which is exactly the
+    /// order a consumer weight table is indexed by (`DESIGN.md` §9).
     pub fn iter(&self) -> impl Iterator<Item = &RoomDef> {
         self.rooms.iter()
     }

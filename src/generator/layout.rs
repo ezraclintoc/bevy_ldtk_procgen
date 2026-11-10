@@ -24,6 +24,13 @@ pub struct OpenDoor {
     pub door: u8,
 }
 
+/// Where one open door's footprint sits: the placement's origin plus the
+/// door's own `local_pos`.
+///
+/// Derived on demand rather than stored: an `OpenDoor` holds no position, so
+/// there is no second copy to go stale and no float to compare — which is how
+/// the old implementation's float door-equality bug is gone rather than fixed.
+#[allow(clippy::missing_docs_in_private_items)]
 pub fn open_door_pos(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<TilePos> {
     let placement = layout.get(d.placement)?;
     let def = catalog.get(placement.room)?;
@@ -34,6 +41,7 @@ pub fn open_door_pos(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<
 /// The direction *this* door faces — i.e. the placed room's own door
 /// definition, not the direction a candidate filling it would need. Used
 /// for `DoorAbandoned { at, dir }`.
+#[allow(clippy::missing_docs_in_private_items)]
 pub fn open_door_dir(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<Dir> {
     let placement = layout.get(d.placement)?;
     let def = catalog.get(placement.room)?;
@@ -41,6 +49,12 @@ pub fn open_door_dir(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<
     Some(door.dir)
 }
 
+/// Which rooms were placed where: the generator's output and the only truth
+/// about the dungeon (`DESIGN.md` §1).
+///
+/// Append-only. Spawned entities are a cache over this, and culling is not
+/// allowed to touch it — otherwise doors reopen, revisited areas regenerate
+/// differently, and the seed stops reproducing.
 #[derive(Debug, Clone, Default)]
 pub struct Layout {
     placements: Vec<Placement>,
@@ -57,14 +71,22 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// The placement a `PlacementId` refers to. Ids are minted only by
+    /// [`Layout::iter`]/[`Layout::commit`], so `None` here is a bug in the
+    /// caller, not a state to handle.
     pub fn get(&self, id: PlacementId) -> Option<&Placement> {
         self.placements.get(id.0 as usize)
     }
 
+    /// How many rooms have been placed, in total, over the whole run.
     pub fn placed_count(&self) -> usize {
         self.placements.len()
     }
 
+    /// The frontier: every door that is placed, unconnected and not abandoned.
+    ///
+    /// Iteration order is slot order, which is placement order — stable across
+    /// runs with the same seed, unlike anything keyed by a `HashMap`.
     pub fn open_doors(&self) -> impl Iterator<Item = (OpenDoorId, &OpenDoor)> {
         self.open_doors
             .iter()
@@ -80,6 +102,8 @@ impl Layout {
             })
     }
 
+    /// Every placement with its id, in placement order — entry `i` is
+    /// `PlacementId(i)`.
     pub fn iter(&self) -> impl Iterator<Item = (PlacementId, &Placement)> {
         self.placements
             .iter()

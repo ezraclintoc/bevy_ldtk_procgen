@@ -773,25 +773,45 @@ mod tests {
         assert_eq!(unlimited.first().copied(), closest_independently);
     }
 
+    /// The one test that would catch "the rooms don't line up": it pins our
+    /// spawn math to `bevy_ecs_ldtk`'s *own* conversion function rather than to
+    /// a re-derivation of our formula.
+    ///
+    /// `pre_spawn_level` places a level child at
+    /// `ldtk_pixel_coords_to_translation(IVec2::new(world_x, world_y + px_hei), 0)`
+    /// under `UseWorldTranslation`. Recomputing `-(world_y + px_hei)` here —
+    /// which this test used to do — passes even when the sign or the height
+    /// handling is wrong, because it is the same expression the production code
+    /// uses. A one-tile error in that expression is exactly a room drawn one
+    /// tile off its placement, so it has to be checked against the library that
+    /// actually does the drawing.
     #[test]
+    #[allow(clippy::cast_possible_truncation)] // world offsets are whole pixels
     fn room_translation_lands_level_content_on_the_origin_corner() {
         let catalog = load_catalog();
         let grid_size = catalog.grid_size() as f32;
-        let def = catalog.iter().next().expect("fixture has rooms");
         let origin = TilePos { x: 5, y: -3 };
 
-        let translation = room_translation(origin, def, grid_size);
+        for def in catalog.iter() {
+            let translation = room_translation(origin, def, grid_size);
 
-        // bevy_ecs_ldtk's UseWorldTranslation offset for the level child,
-        // recomputed here independently of `room_translation` — the two
-        // must cancel exactly at the origin corner.
-        let px_hei = def.size.height as f32 * grid_size;
-        let level_offset = Vec2::new(def.world_offset_px.x, -(def.world_offset_px.y + px_hei));
-        assert_eq!(
-            translation + level_offset,
-            Vec2::new(origin.x as f32 * grid_size, origin.y as f32 * grid_size),
-            "the level content's min corner must land on the placement origin"
-        );
+            // The level child's offset, from the crate that spawns it.
+            let px_hei = def.size.height as f32 * grid_size;
+            let level_offset = bevy_ecs_ldtk::utils::ldtk_pixel_coords_to_translation(
+                IVec2::new(
+                    def.world_offset_px.x.round() as i32,
+                    (def.world_offset_px.y + px_hei).round() as i32,
+                ),
+                0,
+            );
+
+            assert_eq!(
+                translation + level_offset,
+                Vec2::new(origin.x as f32 * grid_size, origin.y as f32 * grid_size),
+                "{}'s content must land exactly on the placement origin",
+                def.identifier
+            );
+        }
     }
 
     fn unit_rect() -> TileRect {

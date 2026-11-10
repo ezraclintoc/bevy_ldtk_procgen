@@ -27,9 +27,14 @@ pub struct OpenDoorId {
     pub(crate) generation: u32,
 }
 
+/// A tile coordinate in `generator/`'s y-up frame. Integer everywhere on
+/// purpose: two integer adds replace the old float comparisons, so no epsilon
+/// and no `float_cmp` (`ARCHITECTURE.md` §3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TilePos {
+    /// Column, increasing to the right.
     pub x: i32,
+    /// Row, increasing upward — LDtk's y-down frame is flipped once, at parse.
     pub y: i32,
 }
 
@@ -55,9 +60,13 @@ impl std::ops::Sub for TilePos {
     }
 }
 
+/// A size in TILES — a room's footprint, or the extent of a clearance strip.
+/// Pixels only enter the picture at the plugin boundary (`ARCHITECTURE.md` §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileSize {
+    /// Extent along x, in tiles.
     pub width: u32,
+    /// Extent along y, in tiles.
     pub height: u32,
 }
 
@@ -69,13 +78,21 @@ pub struct PixelPos {
     pub y: f32,
 }
 
+/// An axis-aligned rectangle in tiles: min corner plus size. One type for
+/// every geometric question in the crate, replacing the old implementation's
+/// three collision helpers with three different conventions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileRect {
+    /// The corner closest to (-inf, -inf) — what a placement stores.
     pub min: TilePos,
+    /// Extent from `min`, in tiles.
     pub size: TileSize,
 }
 
 impl TileRect {
+    /// The exclusive far corner: the first tile *past* the rectangle. With
+    /// [`overlaps`]'s strict `<`, two rooms sharing a wall this way do not
+    /// overlap.
     pub fn max(self) -> TilePos {
         TilePos {
             x: self.min.x + self.size.width as i32,
@@ -83,6 +100,8 @@ impl TileRect {
         }
     }
 
+    /// Whether the tile at `pos` is inside — half-open on the far side, same
+    /// convention as [`TileRect::max`].
     pub fn contains(self, pos: TilePos) -> bool {
         let max = self.max();
         pos.x >= self.min.x && pos.x < max.x && pos.y >= self.min.y && pos.y < max.y
@@ -110,9 +129,13 @@ pub fn overlaps(a: TileRect, b: TileRect) -> bool {
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Dir {
+    /// Up, +y.
     N = 0,
+    /// Right, +x.
     E = 1,
+    /// Down, -y.
     S = 2,
+    /// Left, -x.
     W = 3,
 }
 

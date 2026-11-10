@@ -63,6 +63,10 @@ const HALLWAY_PUSH: f32 = 3.0;
 const HALLWAY_DAMP: f32 = 0.3;
 
 fn main() {
+    // Fixed seed: the point of this example is the *shape* of a bounded run,
+    // and a reproducible one is what makes "the ceiling closes gracefully"
+    // checkable rather than luck. R rerolls from a random seed.
+    info!("meta: seed 424242 — press R for a fresh dungeon");
     App::new()
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
         .add_plugins(LdtkPlugin)
