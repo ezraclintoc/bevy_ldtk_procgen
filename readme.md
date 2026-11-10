@@ -2,6 +2,12 @@
 
 [![Nightly Build](https://github.com/ezraclintoc/bevy_ldtk_procgen/actions/workflows/nightly.yaml/badge.svg)](https://github.com/ezraclintoc/bevy_ldtk_procgen/actions/workflows/nightly.yaml)
 
+---
+
+https://github.com/user-attachments/assets/df5dad66-826a-41e9-9eeb-3b77ddb6030f
+
+---
+
 A procedural, room-by-room level generator for Bevy and LDtk (`bevy_ecs_ldtk`). Author a
 catalog of rooms as LDtk levels, mark their doors, and this plugin randomly connects
 them into a non-linear layout at runtime - no hand-authored dungeon required.
