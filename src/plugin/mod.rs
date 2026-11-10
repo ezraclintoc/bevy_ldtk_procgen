@@ -15,10 +15,10 @@ use crate::generator::layout::Layout;
 use crate::generator::place::StartRoom;
 use crate::generator::weight::CountBy;
 pub use events::{
-    DoorAbandoned, GenerationFailed, GenerationSettled, RoomDespawned, RoomPlaced, RoomSpawned,
+    DoorAbandoned, GenerationFailed, GenerationSettled, Regenerate, RoomDespawned, RoomPlaced,
+    RoomSpawned,
 };
 pub use load::GenerationState;
-use load::LdtkHandle;
 use systems::{DoorAttempts, GenRng, GenerationConfig, PlacementCountersRes};
 pub use systems::{RoomWeights, apply_weights};
 
@@ -59,10 +59,23 @@ pub enum CullingPolicy {
 /// Either a path to load via `AssetServer` (the common case — see this
 /// file's `GeneratorPlugin::new`) or an already-loaded handle (for a
 /// consumer that wants to control preloading — `GeneratorPlugin::from_handle`).
-enum ProjectSource {
+#[derive(Clone)]
+pub(crate) enum ProjectSource {
     Path(String),
     Handle(Handle<LdtkProject>),
 }
+
+/// What to load, parked here until `load::begin_load` runs.
+///
+/// The plugin cannot resolve this in `Plugin::build`: `AssetServer` only
+/// exists once `AssetPlugin` has been built, and plugins are evaluated
+/// strictly in the order they are added, so reading it there would panic on
+/// a perfectly reasonable `add_plugins(GeneratorPlugin::..)` before
+/// `DefaultPlugins`. Storing the source and loading from `Startup` makes the
+/// plugin order-independent by construction — every plugin's `build` has
+/// run by the time any `Startup` system does.
+#[derive(Resource)]
+pub(crate) struct ProjectSourceRes(pub ProjectSource);
 
 pub struct GeneratorPlugin {
     source: ProjectSource,
@@ -139,17 +152,13 @@ impl GeneratorPlugin {
 }
 
 impl Plugin for GeneratorPlugin {
-    /// Loading the project here, not in a separate wrapper: `AssetServer`
-    /// only exists once `DefaultPlugins` has built, so this requires
-    /// `GeneratorPlugin` to be added after `DefaultPlugins` — the same
-    /// ordering requirement `bevy_ecs_ldtk`'s own `LdtkPlugin` has.
+    /// Registration only — no asset loading, no world queries. `build` is
+    /// the one part of the plugin lifecycle whose order relative to other
+    /// plugins the consumer controls, so anything order-sensitive
+    /// (`AssetServer`, `LdtkSettings`) is left to a `Startup` system: see
+    /// `ProjectSourceRes` and `systems::enforce_ldtk_settings`.
     fn build(&self, app: &mut App) {
-        let handle = match &self.source {
-            ProjectSource::Path(path) => app.world().resource::<AssetServer>().load(path.clone()),
-            ProjectSource::Handle(handle) => handle.clone(),
-        };
-
-        app.insert_resource(LdtkHandle(handle))
+        app.insert_resource(ProjectSourceRes(self.source.clone()))
             .insert_resource(GenRng::new(self.seed))
             .insert_resource(GenerationConfig {
                 generation_radius: self.generation_radius,
@@ -171,14 +180,19 @@ impl Plugin for GeneratorPlugin {
             .add_message::<GenerationFailed>()
             .add_message::<DoorAbandoned>()
             .add_message::<GenerationSettled>()
-            .add_systems(Startup, systems::enforce_ldtk_settings)
+            .add_message::<Regenerate>()
+            .add_systems(Startup, (systems::enforce_ldtk_settings, load::begin_load))
             .add_systems(
                 Update,
                 load::poll_ldtk_load.run_if(in_state(GenerationState::Loading)),
             )
             .add_systems(
                 Update,
-                (systems::generate, systems::sync_entities)
+                (
+                    systems::apply_regeneration,
+                    systems::generate,
+                    systems::sync_entities,
+                )
                     .chain()
                     .after(GenerationSet::Weights)
                     .run_if(in_state(GenerationState::Ready)),

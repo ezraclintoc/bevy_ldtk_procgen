@@ -14,6 +14,7 @@ use crate::generator::weight::PlacementCounters;
 use super::CatalogRes;
 use super::events::GenerationFailed;
 use super::systems::{GenerationConfig, PlacementCountersRes};
+use super::{ProjectSource, ProjectSourceRes};
 
 #[derive(States, Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum GenerationState {
@@ -27,6 +28,34 @@ pub enum GenerationState {
     Failed,
 }
 
+/// Starts the load, once per app, from `Startup`.
+///
+/// Deliberately not `GeneratorPlugin::build`: plugins are evaluated in the
+/// order they are added, so `AssetServer` may not exist yet there. By
+/// `Startup` every plugin has been built, whatever the order — so this
+/// needs no ordering requirement and no panic. If there is still no
+/// `AssetServer`, no Bevy asset pipeline is present at all; the app then
+/// idles in `GenerationState::Loading` (DESIGN.md §4: generation idles when
+/// it has nothing to generate, it never aborts the host process).
+pub(crate) fn begin_load(
+    mut commands: Commands,
+    source: Res<ProjectSourceRes>,
+    asset_server: Option<Res<AssetServer>>,
+) {
+    let Some(asset_server) = asset_server else {
+        warn!(
+            "GeneratorPlugin found no AssetServer: add DefaultPlugins (or AssetPlugin) \
+             and generation will stay in GenerationState::Loading"
+        );
+        return;
+    };
+    let handle = match &source.0 {
+        ProjectSource::Path(path) => asset_server.load(path.clone()),
+        ProjectSource::Handle(handle) => handle.clone(),
+    };
+    commands.insert_resource(LdtkHandle(handle));
+}
+
 /// Holds the handle so `poll_ldtk_load` can check on it every frame.
 /// `pub(crate)`, not exported — an implementation detail of how loading is
 /// driven, not part of the plugin's configuration surface.
@@ -37,8 +66,8 @@ pub(crate) struct LdtkHandle(pub Handle<LdtkProject>);
 /// `AssetServer::load_state` never panics on the handle it's given, so this
 /// has no failure mode of its own to guard against.
 pub(crate) fn poll_ldtk_load(
-    asset_server: Res<AssetServer>,
-    handle: Res<LdtkHandle>,
+    asset_server: Option<Res<AssetServer>>,
+    handle: Option<Res<LdtkHandle>>,
     projects: Res<Assets<LdtkProject>>,
     mut config: ResMut<GenerationConfig>,
     mut counters: ResMut<PlacementCountersRes>,
@@ -46,6 +75,13 @@ pub(crate) fn poll_ldtk_load(
     mut failed: MessageWriter<GenerationFailed>,
     mut next_state: ResMut<NextState<GenerationState>>,
 ) {
+    // Optional rather than required: `begin_load` is what proves both exist,
+    // and when it couldn't (no asset pipeline) idling here is correct — the
+    // alternative is a panic for a configuration mistake the state machine
+    // already reports (`GenerationState::Loading` forever).
+    let (Some(asset_server), Some(handle)) = (asset_server, handle) else {
+        return;
+    };
     match asset_server.load_state(handle.0.id()) {
         LoadState::NotLoaded | LoadState::Loading => {}
         LoadState::Failed(err) => {

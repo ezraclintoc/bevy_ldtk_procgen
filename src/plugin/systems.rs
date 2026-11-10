@@ -15,7 +15,9 @@ use crate::generator::layout::{Layout, open_door_dir, open_door_pos};
 use crate::generator::place::{StartRoom, WeightParams, attempt_door, place_start_room};
 use crate::generator::weight::{CountBy, PlacementCounters, ResolvedWeights, WeightContext};
 
-use super::events::{DoorAbandoned, GenerationFailed, RoomDespawned, RoomPlaced, RoomSpawned};
+use super::events::{
+    DoorAbandoned, GenerationFailed, Regenerate, RoomDespawned, RoomPlaced, RoomSpawned,
+};
 use super::load::{GenerationState, LdtkHandle};
 use super::{CatalogRes, CullingPolicy, GenerationAnchor, LayoutRes};
 
@@ -210,7 +212,17 @@ fn should_cull(
 /// Force-set, not a blind `insert_resource` in `Plugin::build`: this must
 /// win even if the consumer sets `LdtkSettings` themselves for unrelated
 /// fields after adding the plugin. See ARCHITECTURE.md §2.
-pub(crate) fn enforce_ldtk_settings(mut settings: ResMut<LdtkSettings>) {
+///
+/// `Option<ResMut<_>>`: a missing `LdtkSettings` means `LdtkPlugin` was never
+/// added, and the honest report for that is a warning plus a load that never
+/// finishes — not a panic out of a library (`AGENTS.md`, lint policy). Bevy's
+/// own guidance is the same: check for the resource rather than assert
+/// another plugin exists, since plugin order is the consumer's to choose.
+pub(crate) fn enforce_ldtk_settings(world: &mut World) {
+    let Some(mut settings) = world.get_resource_mut::<LdtkSettings>() else {
+        warn!("GeneratorPlugin needs LdtkPlugin: LdtkSettings is missing");
+        return;
+    };
     settings.level_spawn_behavior = LevelSpawnBehavior::UseWorldTranslation {
         load_level_neighbors: false,
     };
@@ -486,6 +498,60 @@ fn progresses(max: &Option<(usize, CountBy)>, catalog: &Catalog, def: &RoomDef) 
     }
 }
 
+/// Consumer-written [`Regenerate`]: discard the layout and every spawned
+/// room, reseed, and let `generate` rebuild around the anchor's current
+/// position.
+///
+/// The Layout is truth and spawned entities are a cache over it
+/// (DESIGN.md §1), so regenerating means throwing the truth away — and every
+/// derived structure with it: the open-door set (inside `Layout`), the
+/// per-door failure counts, and the placement counters. The counters are the
+/// subtle one: they are per *catalog*, so keeping them would let the second
+/// dungeon inherit the first one's tag quotas and closure progress and think
+/// it was already at a ceiling it has never been near.
+///
+/// `RoomDespawned` is emitted per dropped room, in placement order, so a
+/// consumer that tracks entities through those messages closes its
+/// bookkeeping instead of holding ids that are now dangling.
+#[allow(clippy::too_many_arguments)] // a Bevy system's parameters are its inputs
+pub(crate) fn apply_regeneration(
+    mut regenerate: MessageReader<Regenerate>,
+    catalog: Res<CatalogRes>,
+    mut layout: ResMut<LayoutRes>,
+    mut rng: ResMut<GenRng>,
+    mut attempts: ResMut<DoorAttempts>,
+    mut counters: ResMut<PlacementCountersRes>,
+    rooms: Query<(Entity, &RoomWorld)>,
+    mut despawned_events: MessageWriter<RoomDespawned>,
+    mut commands: Commands,
+) {
+    // Several presses in one frame collapse to the last: two regenerations
+    // cannot both happen, and the newest seed is the one that was asked for.
+    let Some(seed) = regenerate.read().last().map(|message| message.seed) else {
+        return;
+    };
+
+    // Deterministic order (placement slot, not query order) — same reasoning
+    // as culling's, so the `RoomDespawned` stream doesn't vary run to run.
+    let mut doomed: Vec<(u32, Entity, RoomId)> = rooms
+        .iter()
+        .filter_map(|(entity, room_world)| {
+            let placement = layout.get(room_world.placement)?;
+            Some((room_world.placement.0, entity, placement.room))
+        })
+        .collect();
+    doomed.sort_by_key(|(slot, _, _)| *slot);
+    for (_, entity, room) in doomed {
+        commands.entity(entity).despawn();
+        despawned_events.write(RoomDespawned { room });
+    }
+
+    *layout = LayoutRes::default();
+    *attempts = DoorAttempts::default();
+    *counters = PlacementCountersRes(PlacementCounters::new(&catalog));
+    *rng = GenRng::new(seed);
+}
+
 /// Drains the spawn queue and the cull queue against the (already updated)
 /// Layout — ARCHITECTURE.md §7. All `Commands` and entity access live here;
 /// `generate` deliberately has none.
@@ -532,6 +598,7 @@ pub(crate) fn sync_entities(
         commands.entity(entity).insert(Announced);
         spawned_events.write(RoomSpawned {
             room: placement.room,
+            at: placement.origin,
             entity,
         });
     }

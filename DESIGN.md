@@ -286,7 +286,9 @@ what was generated. That is the largest gap being closed.
 ### Events
 
 - `RoomPlaced { room: RoomId, at: TilePos }` — Layout grew.
-- `RoomSpawned { room: RoomId, entity: Entity }` — entities now exist.
+- `RoomSpawned { room: RoomId, at: TilePos, entity: Entity }` — entities now
+  exist. `at` is the placement origin (the room's min corner in tiles), so a
+  consumer can position things against the room's real bounds.
 - `RoomDespawned { room: RoomId }` — culled; the Layout is unchanged.
 - `GenerationFailed(CatalogErrors)`.
 - `DoorAbandoned { at: TilePos, dir: Dir }` — a door was marked dead after

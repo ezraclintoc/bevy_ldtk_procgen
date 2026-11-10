@@ -97,12 +97,21 @@ Enforced via a `Startup` system that force-sets only these two fields on
 `LdtkSettings`, not a blind `insert_resource` in `Plugin::build`:
 
 ```rust
-fn enforce_ldtk_settings(mut settings: ResMut<LdtkSettings>) {
+fn enforce_ldtk_settings(world: &mut World) {
+    let Some(mut settings) = world.get_resource_mut::<LdtkSettings>() else { return };
     settings.level_spawn_behavior = LevelSpawnBehavior::UseWorldTranslation {
         load_level_neighbors: false,
     };
 }
 ```
+
+Looked up rather than taken as `ResMut<LdtkSettings>`, because a missing
+`LdtkSettings` means the consumer never added `LdtkPlugin` — a warning, not a
+panic out of a library (`AGENTS.md`, lint policy). Same reasoning one level up:
+`Plugin::build` runs in `add_plugins` order, so it must not require a resource
+another plugin creates. `GeneratorPlugin::build` therefore only registers, and
+`load::begin_load` does the `AssetServer::load` from `Startup`, by which point
+every plugin has been built no matter what order the consumer used.
 
 `insert_resource` in `build()` would work only if the consumer never sets
 `LdtkSettings` themselves after adding the plugin — a real thing to want, for
