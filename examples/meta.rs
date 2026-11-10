@@ -6,6 +6,10 @@
 //! Run: `cargo run --example meta` (needs the devShell on NixOS — see
 //! AGENTS.md).
 //!
+//! Controls: **WASD / arrows** move the camera (the anchor, so generation
+//! follows you), **R** starts a fresh dungeon — watch the phase reset to
+//! EXPLORE and the counts climb again.
+//!
 //! What to watch for on the HUD:
 //! - **phase** flips EXPLORE → CLOSE at 80% of the ceiling — that's the
 //!   consumer weight table switching, the per-frame half of meta-generation;
@@ -24,8 +28,9 @@
 //!   many rooms and a table has no memory between them.
 //!
 //! Note the bundled catalog's rooms carry no tags, so this demo shapes
-//! texture by *door count* (long narrow rooms are 6-door connectors) —
-//! tag-based shaping (`tag_max`, `tag_min_depth`) needs a project authored
+//! texture by *door count* — 10 of its 44 rooms have three or more doors, one
+//! of them six, and those are the long connectors `connector` favours.
+//! Tag-based shaping (`tag_max`, `tag_min_depth`) needs a project authored
 //! with the `RoomTags` schema, and is exercised in the library's unit tests
 //! via synthetic definitions.
 
@@ -33,6 +38,8 @@ use bevy::prelude::*;
 use bevy_ecs_ldtk::prelude::*;
 
 use bevy_ldtk_procgen::prelude::*;
+
+mod common;
 
 /// Rooms the dungeon may place. A ceiling, not a target: generation stops
 /// near it, with the frontier capped rather than truncated.
@@ -43,14 +50,16 @@ const CEILING: usize = 60;
 /// both halves push the same direction at the same time.
 const CLOSE_PHASE_START: f32 = 0.8;
 
-/// Multiplier for high-door-count rooms during the EXPLORE phase: long
-/// multi-door connectors spread the dungeon outward, producing the long
-/// spine the demo is named for. Low-door rooms are damped below 1.0
-/// relative to it, not excluded — exclusion is the engine's job.
+/// Weight a full connector (3+ doors) gets during EXPLORE, relative to its
+/// base weight: long multi-door rooms spread the dungeon outward, producing
+/// the long spine the demo is named for. Rooms with fewer doors keep weight
+/// ≈ 1.0 — damped relative to connectors, never excluded (exclusion is the
+/// engine's job, not a weight table's).
 const HALLWAY_PUSH: f32 = 3.0;
 
-/// Multiplier for high-door rooms during CLOSE: under 1.0 to help the
-/// engine's bias shrink the frontier.
+/// Weight a full connector gets during CLOSE — under 1.0 so the engine's
+/// closure bias has a shrinking frontier to work with rather than fresh
+/// hallway to expand into.
 const HALLWAY_DAMP: f32 = 0.3;
 
 fn main() {
@@ -77,7 +86,8 @@ fn main() {
                 phase_weights
                     .pipe(apply_weights)
                     .in_set(GenerationSet::Weights),
-                drift_anchor,
+                common::move_with_wasd::<Camera>,
+                common::regenerate_on_key,
                 warn_on_abandoned_doors,
                 show_generation_failure,
                 update_hud,
@@ -105,13 +115,14 @@ enum Phase {
 /// simply gets its base weight again.
 ///
 /// Door counts come from the catalog (setup-time data, cheap to read);
-/// the *phase* is external state this system owns.
+/// the *phase* is external state this system owns. The table is built fresh
+/// each frame — allocating a `Vec` of a few dozen floats per frame is not
+/// worth a `Local` cache whose lifetime the sinking system owns.
 #[allow(clippy::needless_pass_by_value)] // Bevy system parameters
 fn phase_weights(
     catalog: Res<CatalogRes>,
     layout: Res<LayoutRes>,
     mut phase: ResMut<Phase>,
-    mut cache: Local<Vec<f32>>,
 ) -> Vec<f32> {
     let max = if CEILING == 0 { 1 } else { CEILING };
     // Intentionally-lossy cast, warn-level lint: room counts are tiny
@@ -124,35 +135,23 @@ fn phase_weights(
         Phase::Explore
     };
 
-    // Reuse the allocation across frames — Local<Vec> persists.
-    cache.clear();
-    cache.extend(catalog.iter().map(|def| {
-        // 3+ door rooms are the long connectors; single/double-door rooms
-        // are ordinary chambers and caps. `connector` ramps 0.0 → 1.0 over
-        // 1..=3 doors, so EXPLORE pushes multi-door rooms up to
-        // HALLWAY_PUSH and CLOSE damps them toward HALLWAY_DAMP — while
-        // caps and chambers keep weight ≈ 1.0 in both phases.
-        #[allow(clippy::cast_precision_loss)] // tiny counts; see above
-        let doors = def.doors.len().max(1) as f32;
-        let connector = (doors / 3.0).min(1.0);
-        match *phase {
-            Phase::Explore => 1.0 + connector * (HALLWAY_PUSH - 1.0),
-            Phase::Close => 1.0 + connector * (HALLWAY_DAMP - 1.0),
-        }
-    }));
-    cache.clone()
-}
-
-/// Idle drift so the demo shows streaming without input: the anchor wanders
-/// east at a steady clip, outrunning the dungeon edge and pulling new rooms
-/// in ahead of it. Replace with the `full` example's WASD player for
-/// interactive use. `Res<Time>` is a Bevy system parameter, taken by value.
-#[allow(clippy::needless_pass_by_value)]
-fn drift_anchor(time: Res<Time>, mut anchor: Query<&mut Transform, With<GenerationAnchor>>) {
-    let Ok(mut transform) = anchor.single_mut() else {
-        return;
-    };
-    transform.translation.x += 60.0 * time.delta_secs();
+    catalog
+        .iter()
+        .map(|def| {
+            // 3+ door rooms are the long connectors; single/double-door rooms
+            // are ordinary chambers and caps. `connector` ramps 0.0 → 1.0 over
+            // 1..=3 doors, so EXPLORE pushes multi-door rooms up to
+            // HALLWAY_PUSH and CLOSE damps them toward HALLWAY_DAMP — while
+            // caps and chambers keep weight ≈ 1.0 in both phases.
+            #[allow(clippy::cast_precision_loss)] // tiny counts; see above
+            let doors = def.doors.len().max(1) as f32;
+            let connector = (doors / 3.0).min(1.0);
+            match *phase {
+                Phase::Explore => 1.0 + connector * (HALLWAY_PUSH - 1.0),
+                Phase::Close => 1.0 + connector * (HALLWAY_DAMP - 1.0),
+            }
+        })
+        .collect()
 }
 
 /// `MessageReader` must be taken by value as a system parameter.

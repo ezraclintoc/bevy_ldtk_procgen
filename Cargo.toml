@@ -4,9 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
-# examples/ are real build targets (autoexamples): `minimal` is the full
-# demo the flake packages, `testing` the bare-bones smoke setup. They
-# double as the executable form of this crate's documented API.
+# examples/ are real build targets (autoexamples) and double as the
+# executable form of this crate's documented API: `testing` is the bare-bones
+# smoke setup, `minimal` the output-API demo the flake packages, `full` the
+# interactive one (player, wall collision), `meta` meta-generation.
 
 [dependencies]
 bevy = {version="0.18.0", features=["pan_camera", "debug"] }

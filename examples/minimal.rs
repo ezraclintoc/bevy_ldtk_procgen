@@ -1,16 +1,24 @@
-//! The full demo: streaming generation around a `GenerationAnchor`, with
-//! the output API a consumer reaches for — `RoomSpawned` to attach gameplay,
-//! `DoorAbandoned` and `GenerationFailed` surfaced, `Layout`'s room count
-//! and the point → room query on a HUD.
+//! The output-API demo: streaming generation around a `GenerationAnchor`,
+//! with everything a consumer reads back — `RoomSpawned` to attach gameplay,
+//! `DoorAbandoned` and `GenerationFailed` surfaced, `Layout`'s room count and
+//! the point → room query on a HUD.
 //!
 //! Run: `cargo run --example minimal` (needs the devShell on NixOS — see
-//! AGENTS.md). Deliberately excludes meta-generation (`DESIGN.md` §9) —
-//! that's a second, more advanced example once this one is settled.
+//! AGENTS.md).
+//!
+//! Controls: **WASD / arrows** move the camera (which is the anchor, so the
+//! dungeon streams as you go), **R** regenerates the dungeon around you.
+//!
+//! The rest of the set: `testing` is the barest plugin wiring plus a debug
+//! overlay, `full` adds a player, wall collision and visibility, `meta` adds
+//! meta-generation weights.
 
 use bevy::prelude::*;
 use bevy_ecs_ldtk::prelude::*;
 
 use bevy_ldtk_procgen::prelude::*;
+
+mod common;
 
 fn main() {
     // No `insert_resource(LdtkSettings { .. })` here: GeneratorPlugin enforces
@@ -31,7 +39,9 @@ fn main() {
         .add_systems(
             Update,
             (
-                mark_chest_rooms,
+                common::move_with_wasd::<Camera>,
+                common::regenerate_on_key,
+                tint_intersection_rooms,
                 warn_on_abandoned_doors,
                 show_generation_failure,
                 update_hud,
@@ -44,27 +54,48 @@ fn spawn_camera(mut commands: Commands) {
     commands.spawn((Camera2d, GenerationAnchor));
 }
 
+/// Rooms with at least this many doors get tinted: the junctions a minimap
+/// would draw as intersections. Four of the bundled 44 rooms qualify (7 levels
+/// have one door, 27 two, 6 three, 3 four, 1 six).
+const INTERSECTION_DOORS: usize = 4;
+
 /// `RoomSpawned` (`DESIGN.md` §4) is the seam for attaching gameplay to a
-/// generated room. `Catalog::tag_id` is a by-name lookup, resolved once here
-/// via `Local` rather than by name every event, per `DESIGN.md` §2.
-fn mark_chest_rooms(
+/// generated room: the entity exists, its tilemap is spawned, and the catalog
+/// is readable.
+///
+/// Selection is by **door count**, not by tag. Tag-driven selection is the
+/// same shape (`def.bool_tag(tag_id)`, with `tag_id` cached in a `Local` so
+/// `Catalog::tag_id` resolves the name once instead of per event, per
+/// `DESIGN.md` §2) — but the bundled catalog declares no `RoomTags` at all, so
+/// a lookup on it could only ever miss and this example would silently attach
+/// nothing.
+///
+/// The child sprite is offset by half the room's size because a room entity's
+/// translation puts the level's **min corner** on the placement origin, so the
+/// sprite then covers exactly the room. Tiles → pixels happens here, at the
+/// plugin boundary, never inside `generator/` (`ARCHITECTURE.md` §2).
+#[allow(clippy::cast_precision_loss)] // room sizes are tiny; exact in f32
+fn tint_intersection_rooms(
     mut spawned: MessageReader<RoomSpawned>,
-    mut chest_tag: Local<Option<Option<TagId>>>,
     catalog: Res<CatalogRes>,
     mut commands: Commands,
 ) {
-    let chest_tag = *chest_tag.get_or_insert_with(|| catalog.tag_id("chest"));
-    let Some(chest_tag) = chest_tag else {
-        return;
-    };
+    let grid_size = catalog.grid_size() as f32;
 
     for event in spawned.read() {
         let Some(def) = catalog.get(event.room) else {
             continue;
         };
-        if def.bool_tag(chest_tag) {
-            commands.entity(event.entity).insert(PointLight::default());
+        if def.doors.len() < INTERSECTION_DOORS {
+            continue;
         }
+        let size = Vec2::new(def.size.width as f32, def.size.height as f32) * grid_size;
+        commands.entity(event.entity).with_children(|parent| {
+            parent.spawn((
+                Sprite::from_color(Color::srgba(0.25, 0.55, 1.0, 0.15), size),
+                Transform::from_xyz(size.x / 2.0, size.y / 2.0, 1.0),
+            ));
+        });
     }
 }
 
