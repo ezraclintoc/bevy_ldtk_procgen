@@ -198,7 +198,7 @@
 //!
 //! # Performance
 //!
-//! Placing a room costs ~10 µs, flat to a million rooms (~27 bytes of memory
+//! Placing a room costs ~10 µs, flat to ten million rooms (~29 bytes of memory
 //! each). Spawning one is the expensive part (~2.6 µs per tile), which is why
 //! rooms are placed well ahead of what is loaded and why the default
 //! [`SpawnBudget`] learns, per machine, how much it can spawn per frame
