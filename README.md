@@ -1,6 +1,8 @@
 # bevy_ldtk_procgen
 
 [![Nightly Build](https://github.com/ezraclintoc/bevy_ldtk_procgen/actions/workflows/nightly.yaml/badge.svg)](https://github.com/ezraclintoc/bevy_ldtk_procgen/actions/workflows/nightly.yaml)
+[![crates.io](https://img.shields.io/crates/v/bevy_ldtk_procgen)](https://crates.io/crates/bevy_ldtk_procgen)
+[![docs.rs](https://img.shields.io/docsrs/bevy_ldtk_procgen)](https://docs.rs/bevy_ldtk_procgen)
 [![Status: pre-alpha](https://img.shields.io/badge/status-pre--alpha-red)](https://github.com/ezraclintoc/bevy_ldtk_procgen)
 
 A procedural, room-by-room level generator for Bevy and LDtk (`bevy_ecs_ldtk`). Author a
@@ -22,7 +24,7 @@ FPS is capped by the recording monitor's 60 Hz vsync.*
 
 | `bevy_ldtk_procgen` | `bevy` | `bevy_ecs_ldtk` |
 | ------------------- | ------ | --------------- |
-| unreleased          | `0.20` | `0.16`          |
+| `0.1`               | `0.20` | `0.16`          |
 
 ## Features
 
@@ -140,18 +142,15 @@ benchmark: `cargo test --release --lib bench_ -- --ignored --nocapture`.
 
 ## Installation
 
-Not published to crates.io yet, so add it as a git dependency:
-
-```toml
-[dependencies]
-bevy_ldtk_procgen = { git = "https://github.com/ezraclintoc/bevy_ldtk_procgen" }
+```bash
+cargo add bevy_ldtk_procgen
 ```
 
-Pin a commit while the crate is pre-alpha, since `main` moves without regard for
-breaking changes:
+The crate is pre-alpha: expect breaking changes in every `0.x` release. For unreleased
+changes, depend on `main` instead:
 
 ```toml
-bevy_ldtk_procgen = { git = "https://github.com/ezraclintoc/bevy_ldtk_procgen", rev = "<commit sha>" }
+bevy_ldtk_procgen = { git = "https://github.com/ezraclintoc/bevy_ldtk_procgen" }
 ```
 
 Bevy needs system graphics, input, and audio libraries present at runtime. On NixOS the
