@@ -633,6 +633,7 @@ fn update_hud(
     order: Res<GenerationOrder>,
     reach: Res<OriginReach>,
     layout: Res<LayoutRes>,
+    spawn_rate: Res<SpawnRate>,
     diagnostics: Res<DiagnosticsStore>,
     rooms: Query<(), With<LevelIid>>,
     camera: Query<&Projection, With<Camera>>,
@@ -657,7 +658,7 @@ fn update_hud(
         "FPS: {fps:>4.0}   seed: {}   state: {:?}   order: {:?}{}\n\
          rooms: {:>7} placed, {:>5} loaded   open doors: {:>5}   zoom: {zoom:>5.2}\n\
          placing: {:>3} this frame, peak {:>3}/frame, {placed_per_s:>6}/s   \
-         loading: {loaded_per_s:>4}/s\n\
+         loading: {loaded_per_s:>4}/s (budget {:>5} tiles/frame)\n\
          WASD move · wheel zoom · R regenerate · Shift+R same seed · F1 menu",
         seed.0,
         state.get(),
@@ -672,5 +673,6 @@ fn update_hud(
         layout.open_doors().count(),
         throughput.frame,
         throughput.peak_frame(),
+        spawn_rate.tiles_per_frame,
     );
 }

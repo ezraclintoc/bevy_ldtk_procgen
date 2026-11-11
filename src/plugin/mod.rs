@@ -191,6 +191,55 @@ pub enum GenerationOrder {
     FromOrigin,
 }
 
+/// How much tilemap the plugin may spawn per frame, counted in tiles of room
+/// area: spawning a room costs in proportion to its tiles
+/// (`bevy_ecs_tilemap` makes one entity per tile), so a tile budget treats a
+/// project of small rooms and one of large rooms alike, whatever the grid
+/// size. Nearest rooms spawn first; a room bigger than the whole budget still
+/// spawns, alone.
+///
+/// The cost is per machine (~2.6 µs a tile on the machine the defaults were
+/// measured on), which is why the default adapts. A resource, so it can
+/// change at runtime, e.g. a large fixed budget behind a loading screen.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnBudget {
+    /// Learn what this machine can afford. The plugin tracks the normal
+    /// frame time while nothing is spawning; while spawning, it raises the
+    /// budget as long as frames stay near that, and halves it when a frame
+    /// runs long (a missed vsync, or ~30% over the baseline), remembering a
+    /// ceiling just below the level that caused it. A slow machine loads
+    /// rooms more slowly instead of stuttering; a fast one loads them
+    /// sooner. [`SpawnRate`] shows the current value.
+    Adaptive {
+        /// Never below this, however slow frames get. At least one room
+        /// spawns each frame regardless, so the dungeon always keeps
+        /// loading.
+        min_tiles: u32,
+        /// Never above this.
+        max_tiles: u32,
+    },
+    /// Exactly this many tiles a frame, whatever it costs.
+    Fixed(u32),
+}
+
+impl Default for SpawnBudget {
+    fn default() -> Self {
+        Self::Adaptive {
+            min_tiles: 32,
+            max_tiles: 16_384,
+        }
+    }
+}
+
+/// The spawn budget in effect this frame, in tiles: the fixed value, or
+/// where [`SpawnBudget::Adaptive`] has settled. Maintained by the plugin;
+/// read it, don't write it.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpawnRate {
+    /// Tiles of room area spawned per frame at most.
+    pub tiles_per_frame: u32,
+}
+
 /// The seed the current dungeon is generated from — the one passed to
 /// [`GeneratorPlugin::with_seed`] or [`Regenerate`], or, when none was, the
 /// random one the plugin drew. Every dungeon has one, so any dungeon can be
@@ -255,6 +304,7 @@ pub struct GeneratorPlugin {
     start: StartRoom,
     culling: CullingPolicy,
     order: GenerationOrder,
+    spawn_budget: SpawnBudget,
     door_source: DoorSource,
     weight_config: crate::generator::weight::WeightConfig,
 }
@@ -282,6 +332,7 @@ impl GeneratorPlugin {
             start: StartRoom::default(),
             culling: CullingPolicy::radius(view_radius),
             order: GenerationOrder::default(),
+            spawn_budget: SpawnBudget::default(),
             door_source: DoorSource::default(),
             weight_config: Default::default(),
         }
@@ -334,6 +385,13 @@ impl GeneratorPlugin {
         self
     }
 
+    /// How much tilemap to spawn per frame (see [`SpawnBudget`]). Defaults
+    /// to adapting to the machine.
+    pub fn with_spawn_budget(mut self, budget: SpawnBudget) -> Self {
+        self.spawn_budget = budget;
+        self
+    }
+
     /// Where room doors come from: `Door` entities
     /// ([`DoorSource::Entities`], the default) or gaps in an `IntGrid` wall
     /// layer ([`DoorSource::IntGridGaps`]).
@@ -382,6 +440,9 @@ impl Plugin for GeneratorPlugin {
                 culling: self.culling,
             })
             .insert_resource(self.order)
+            .insert_resource(self.spawn_budget)
+            .init_resource::<SpawnRate>()
+            .init_resource::<systems::SpawnController>()
             .init_resource::<OriginReach>()
             .init_resource::<systems::OriginFrontierRes>()
             .init_resource::<systems::SpawnCursor>()

@@ -24,7 +24,7 @@ use super::events::{
 use super::load::{GenerationState, LdtkHandle};
 use super::{
     CatalogRes, CullingPolicy, GenerationAnchor, GenerationOrder, GenerationSeed, LayoutRes,
-    OriginReach, StreamingRadii,
+    OriginReach, SpawnBudget, SpawnRate, StreamingRadii,
 };
 
 /// After this many exhausted attempts (`attempt_door` returning `None`,
@@ -90,14 +90,6 @@ pub struct RoomWeights(pub Option<Vec<f32>>);
 pub fn apply_weights(In(table): In<Vec<f32>>, mut room_weights: ResMut<RoomWeights>) {
     *room_weights = RoomWeights(Some(table));
 }
-
-/// How many ROOMS (one `bevy_ecs_ldtk` world each — not doors) `sync_entities`
-/// spawns per frame. Entity spawning — `bevy_ecs_ldtk` materializing
-/// tilemaps — is throttled separately from generation (DESIGN.md §5): the
-/// budget above caps placement math, this caps tilemap-spawn cost, measured
-/// at ~0.12 ms per room plus a fixed per-burst cost. Nearest rooms spawn
-/// first, so a low cap only delays the far edge.
-const ROOM_SPAWNS_PER_FRAME: usize = 4;
 
 /// Above this many spatial-hash cells, a "what's near the anchor" query is
 /// answered by a plain scan instead: a huge radius covers more cells than
@@ -716,6 +708,10 @@ pub(crate) fn sync_entities(
     catalog: Res<CatalogRes>,
     layout: Res<LayoutRes>,
     radii: Res<StreamingRadii>,
+    budget: Res<SpawnBudget>,
+    mut controller: ResMut<SpawnController>,
+    mut rate: ResMut<SpawnRate>,
+    time: Res<Time<Real>>,
     handle: Res<LdtkHandle>,
     anchors: Query<&GlobalTransform, With<GenerationAnchor>>,
     rooms: Query<(Entity, &RoomWorld, Option<&Announced>, Option<&Children>)>,
@@ -728,6 +724,16 @@ pub(crate) fn sync_entities(
         return;
     }
     let anchors = anchor_tiles(&anchors, grid_size);
+    let tiles_per_frame = match *budget {
+        SpawnBudget::Fixed(tiles) => tiles,
+        SpawnBudget::Adaptive {
+            min_tiles,
+            max_tiles,
+        } => controller.update(time.delta_secs() * 1000.0, min_tiles, max_tiles),
+    };
+    if rate.tiles_per_frame != tiles_per_frame {
+        rate.tiles_per_frame = tiles_per_frame;
+    }
 
     // `RoomSpawned` fires when the room's entities actually exist: the
     // level child `bevy_ecs_ldtk` spawns has produced content of its own
@@ -787,10 +793,18 @@ pub(crate) fn sync_entities(
     let mut queue: Vec<(f32, PlacementId)> = Vec::new();
     match radii.culling.spawn_radius() {
         None => {
-            while cursor.0 < layout.placed_count() && queue.len() < ROOM_SPAWNS_PER_FRAME {
+            // Budgeted here rather than below: the cursor must not move
+            // past a room this frame doesn't spawn.
+            let mut planned = 0u32;
+            while cursor.0 < layout.placed_count() {
                 let id = PlacementId(u32::try_from(cursor.0).unwrap_or(u32::MAX));
+                let area = room_area(&layout, &catalog, id);
+                if planned > 0 && planned.saturating_add(area) > tiles_per_frame {
+                    break;
+                }
                 cursor.0 += 1;
                 if !live.contains(&id) {
+                    planned = planned.saturating_add(area);
                     queue.push((0.0, id));
                 }
             }
@@ -844,13 +858,23 @@ pub(crate) fn sync_entities(
         }
     }
 
-    for (_, placement_id) in queue.into_iter().take(ROOM_SPAWNS_PER_FRAME) {
+    // Spawn in order until the tile budget is spent. Stop rather than skip
+    // to a smaller room: the next-nearest room would otherwise wait behind
+    // every smaller, further one, and it is first in line next frame.
+    let mut spent = 0u32;
+    for (_, placement_id) in queue {
         let Some(placement) = layout.get(placement_id) else {
             continue;
         };
         let Some(def) = catalog.get(placement.room) else {
             continue;
         };
+        let area = def.size.width.saturating_mul(def.size.height);
+        if spent > 0 && spent.saturating_add(area) > tiles_per_frame {
+            break;
+        }
+        spent = spent.saturating_add(area);
+        controller.spawned(area);
         commands.spawn((
             LdtkProjectHandle::from(handle.0.clone()),
             LevelSet::from_iids([def.iid.clone()]),
@@ -864,6 +888,134 @@ pub(crate) fn sync_entities(
             },
         ));
     }
+}
+
+/// [`SpawnBudget::Adaptive`]'s state. Spawn cost doesn't land in
+/// `sync_entities` itself but over the next frames, in `bevy_ecs_ldtk`'s
+/// level processing and tilemap meshing, so the only honest measure is the
+/// frame time — compared against the same machine's frame time when
+/// nothing is spawning, which also makes it work under vsync (where a frame
+/// over budget shows as a missed refresh, not a slightly longer frame).
+#[derive(Resource, Debug, Clone, Copy)]
+pub(crate) struct SpawnController {
+    /// Current budget, tiles.
+    tiles: f32,
+    /// Growth stops here: just below the last budget that ran long. Creeps
+    /// back up while frames stay smooth, since that spike may have been
+    /// something else (a hiccup, the game's own loading).
+    ceiling: f32,
+    /// Typical frame time with nothing spawning, ms. `None` until the
+    /// first quiet frame.
+    baseline: Option<f32>,
+    /// Frames since a room was last spawned. Its cost shows up for a few
+    /// frames after, so only frames well clear of spawning feed the
+    /// baseline, and only frames close to it are judged.
+    quiet: u32,
+    /// Tiles spawned since the last `update`. A budget only grows when it
+    /// was actually used: rooms trickling in a few at a time cost little
+    /// whatever the budget says, and growing on them would leave a budget
+    /// far above anything tested waiting for the next big burst.
+    spent: u32,
+    /// Judged frames since one last ran long.
+    smooth: u32,
+}
+
+impl Default for SpawnController {
+    fn default() -> Self {
+        Self {
+            tiles: 512.0,
+            ceiling: f32::MAX,
+            baseline: None,
+            quiet: u32::MAX,
+            spent: 0,
+            smooth: 0,
+        }
+    }
+}
+
+/// After a long frame, the ceiling stays where it was put for this many
+/// smooth frames before it starts lifting again.
+const CEILING_HOLD_FRAMES: u32 = 120;
+
+/// How many frames a spawn's cost keeps showing up in frame time.
+const SPAWN_EFFECT_FRAMES: u32 = 3;
+
+impl SpawnController {
+    /// Feed last frame's duration; returns this frame's budget.
+    #[allow(clippy::cast_precision_loss)] // tile budgets are far below 2^24
+    pub(crate) fn update(&mut self, frame_ms: f32, min_tiles: u32, max_tiles: u32) -> u32 {
+        let (min, max) = (min_tiles as f32, max_tiles.max(min_tiles) as f32);
+        let spent = std::mem::take(&mut self.spent) as f32;
+        if frame_ms.is_finite() && frame_ms > 0.0 {
+            let baseline = *self.baseline.get_or_insert(frame_ms);
+            if self.quiet > SPAWN_EFFECT_FRAMES {
+                // Slow average: one long idle frame shouldn't move it much.
+                self.baseline = Some(baseline + (frame_ms - baseline) * 0.05);
+            } else {
+                // While spawning, a faster frame still pulls the baseline
+                // down (smoothed: frame times jitter, under vsync especially,
+                // and one fluke-short frame must not become the bar). It
+                // only creeps up when frames run long with the budget already
+                // at its minimum, i.e. the baseline itself is wrong: a window
+                // moved to a slower display, or a heavier scene. Creeping
+                // otherwise would absorb the spawn cost into the baseline and
+                // let the budget run away.
+                if frame_ms < baseline {
+                    self.baseline = Some(baseline + (frame_ms - baseline) * 0.1);
+                } else if self.tiles <= min {
+                    self.baseline = Some(baseline * 1.002);
+                }
+                // Long = over the baseline by 30% + 1 ms, and by at least
+                // 4 ms. Under vsync that means a missed refresh; without
+                // vsync, a few ms of spawn cost on a fast machine isn't a
+                // stutter, and a tighter bar would pin the budget at its
+                // minimum.
+                if frame_ms > baseline + (baseline * 0.3 + 1.0).max(4.0) {
+                    // What actually ran long is what was spawned, not the
+                    // (possibly unused) budget.
+                    let cost = if spent > 0.0 {
+                        spent.min(self.tiles)
+                    } else {
+                        self.tiles
+                    };
+                    self.ceiling = (cost * 0.75).max(min);
+                    self.tiles = cost * 0.5;
+                    self.smooth = 0;
+                } else if spent * 2.0 >= self.tiles {
+                    // The ceiling holds for a while after a long frame, so a
+                    // long load probes it at most every couple of seconds,
+                    // then lifts quickly (the additive part climbs out of a
+                    // low one).
+                    self.smooth = self.smooth.saturating_add(1);
+                    if self.smooth > CEILING_HOLD_FRAMES {
+                        self.ceiling = (self.ceiling * 1.01 + 8.0).min(f32::MAX);
+                    }
+                    let next = self.tiles + (self.tiles / 8.0).max(32.0);
+                    self.tiles = next.min(self.ceiling.max(self.tiles));
+                }
+            }
+        }
+        self.quiet = self.quiet.saturating_add(1);
+        self.tiles = self.tiles.clamp(min, max);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // clamped to u32 inputs
+        let tiles = self.tiles as u32;
+        tiles
+    }
+
+    /// A room of `tiles` area was spawned this frame.
+    pub(crate) fn spawned(&mut self, tiles: u32) {
+        self.quiet = 0;
+        self.spent = self.spent.saturating_add(tiles);
+    }
+}
+
+/// A placed room's area in tiles — what [`SpawnBudget`] counts. 0 for an id
+/// the Layout doesn't know, which never happens for ids it handed out.
+fn room_area(layout: &Layout, catalog: &Catalog, id: PlacementId) -> u32 {
+    layout
+        .get(id)
+        .and_then(|p| catalog.get(p.room))
+        .map_or(0, |def| def.size.width.saturating_mul(def.size.height))
 }
 
 /// Keeps [`StreamingRadii`] sane whenever anything writes it — the builder,
@@ -1136,5 +1288,144 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A machine for [`SpawnController`] to run on: a frame costs `base_ms`
+    /// plus `ms_per_tile` for what was spawned the frame before (spawn cost
+    /// lands a frame late), rounded up to whole refreshes under vsync.
+    struct Machine {
+        base_ms: f32,
+        ms_per_tile: f32,
+        vsync_ms: Option<f32>,
+    }
+
+    impl Machine {
+        fn frame_ms(&self, tiles_spawned_last_frame: u32) -> f32 {
+            let work = self.base_ms + tiles_spawned_last_frame as f32 * self.ms_per_tile;
+            match self.vsync_ms {
+                Some(refresh) => (work / refresh).ceil() * refresh,
+                None => work,
+            }
+        }
+    }
+
+    /// Runs 60 quiet frames, then 1200 with an endless backlog of rooms.
+    /// Returns (mean tiles per frame, fraction of frames that ran long)
+    /// over the last 1000 frames.
+    fn run(machine: &Machine) -> (f32, f32) {
+        let mut controller = SpawnController::default();
+        let mut last = 0u32;
+        let (mut tiles_sum, mut long, mut judged) = (0u64, 0u32, 0u32);
+        for frame in 0..1260 {
+            let frame_ms = machine.frame_ms(last);
+            let budget = controller.update(frame_ms, 32, 16_384);
+            if frame >= 260 {
+                judged += 1;
+                tiles_sum += u64::from(budget);
+                let base = machine.frame_ms(0);
+                if frame_ms > base + (base * 0.3 + 1.0).max(4.0) {
+                    long += 1;
+                }
+            }
+            last = if frame >= 60 {
+                controller.spawned(budget);
+                budget
+            } else {
+                0
+            };
+        }
+        (
+            tiles_sum as f32 / judged as f32,
+            long as f32 / judged as f32,
+        )
+    }
+
+    #[test]
+    fn adaptive_spawn_budget_settles_on_each_machine() {
+        // This machine, measured: ~2.6 us/tile, 3 ms frames, vsync off.
+        let fast = Machine {
+            base_ms: 3.0,
+            ms_per_tile: 0.0026,
+            vsync_ms: None,
+        };
+        // 3x slower, on a 60 Hz display: 833 tiles fit before a refresh is
+        // missed.
+        let slow = Machine {
+            base_ms: 10.0,
+            ms_per_tile: 0.008,
+            vsync_ms: Some(1000.0 / 60.0),
+        };
+        // 10x slower, barely holding 60 Hz: 100 tiles fit.
+        let weak = Machine {
+            base_ms: 14.0,
+            ms_per_tile: 0.026,
+            vsync_ms: Some(1000.0 / 60.0),
+        };
+        for (name, machine, min_mean) in [
+            ("fast", fast, 500.0),
+            ("slow", slow, 300.0),
+            ("weak", weak, 50.0),
+        ] {
+            let (mean, long) = run(&machine);
+            println!(
+                "{name}: {mean:.0} tiles/frame, {:.1}% frames long",
+                long * 100.0
+            );
+            assert!(mean >= min_mean, "{name}: only {mean:.0} tiles/frame");
+            assert!(
+                long < 0.02,
+                "{name}: {:.1}% of frames ran long",
+                long * 100.0
+            );
+        }
+    }
+
+    /// Rooms trickling in (a few tiles a frame) must not inflate the
+    /// budget: the next burst would be spawned all at once, untested.
+    #[test]
+    fn trickle_spawning_does_not_grow_the_budget() {
+        let mut controller = SpawnController::default();
+        for _ in 0..60 {
+            controller.update(3.0, 32, 16_384);
+        }
+        let mut budget = 0;
+        for _ in 0..600 {
+            budget = controller.update(3.0, 32, 16_384);
+            controller.spawned(40);
+        }
+        assert_eq!(budget, 512, "budget grew to {budget} on 40-tile frames");
+    }
+
+    /// Dragging the window from a 144 Hz display to a 60 Hz one mid-load:
+    /// every frame now takes 16.7 ms, which the old baseline would call
+    /// long forever. The budget must recover instead of staying pinned at
+    /// its minimum.
+    #[test]
+    fn budget_recovers_after_moving_to_a_slower_display() {
+        let fast_display = Machine {
+            base_ms: 3.0,
+            ms_per_tile: 0.0026,
+            vsync_ms: Some(1000.0 / 144.0),
+        };
+        let slow_display = Machine {
+            vsync_ms: Some(1000.0 / 60.0),
+            ..fast_display
+        };
+        let mut controller = SpawnController::default();
+        let mut last = 0;
+        for frame in 0..1200 {
+            let machine = if frame < 300 {
+                &fast_display
+            } else {
+                &slow_display
+            };
+            let budget = controller.update(machine.frame_ms(last), 32, 16_384);
+            controller.spawned(budget);
+            last = budget;
+        }
+        assert!(
+            last > 1000,
+            "budget stuck at {last} after the display change"
+        );
     }
 }

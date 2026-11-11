@@ -45,6 +45,6 @@ pub mod prelude {
         CatalogRes, CullingPolicy, DoorAbandoned, GenerationAnchor, GenerationFailed,
         GenerationOrder, GenerationSeed, GenerationSet, GenerationSettled, GenerationState,
         GeneratorPlugin, LayoutRes, OriginReach, Regenerate, RoomDespawned, RoomPlaced,
-        RoomSpawned, RoomWeights, StreamingRadii, apply_weights,
+        RoomSpawned, RoomWeights, SpawnBudget, SpawnRate, StreamingRadii, apply_weights,
     };
 }
