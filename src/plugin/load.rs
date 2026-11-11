@@ -7,7 +7,7 @@ use bevy::asset::LoadState;
 use bevy::prelude::*;
 use bevy_ecs_ldtk::prelude::*;
 
-use crate::generator::catalog::{CatalogError, build_catalog};
+use crate::generator::catalog::{CatalogError, build_catalog_with};
 use crate::generator::error::CatalogErrors;
 use crate::generator::weight::PlacementCounters;
 
@@ -109,7 +109,7 @@ pub(crate) fn poll_ldtk_load(
                 // treat this as a failure.
                 return;
             };
-            match build_catalog(project.json_data()) {
+            match build_catalog_with(project.json_data(), &config.door_source) {
                 Ok(catalog) => {
                     // Not an error — the rest of the catalog works — but the
                     // room is dead weight, and only the editor can fix it.

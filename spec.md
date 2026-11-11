@@ -43,8 +43,18 @@ so no setting can load and unload a room on alternate frames.
 
 ### Catalog - `build_catalog` (`generator/catalog.rs`)
 
-Parses levels into `RoomDef`s: size, doors, tags. Door direction comes from which level
-edge the entity touches, and width from its extent along that edge. Rooms are indexed by
+Parses levels into `RoomDef`s: size, doors, tags. Doors come from one of two sources
+(`DoorSource`, chosen at runtime):
+
+- `Entities` (default): `Door` entities. Direction comes from which level edge the entity
+  touches, and width from its extent along that edge.
+- `IntGridGaps { layer }`: each maximal run of empty (`0`) cells along a level edge of
+  the named IntGrid layer is a door that wide; any nonzero value is wall. Corners are
+  excluded, and an open corner is a `DoorAtCorner` error, since its direction would be
+  ambiguous. On the bundled 16px map both sources give identical doors for all 44 rooms
+  (tested).
+
+ Rooms are indexed by
 (direction, width) in a 4-element array, never a `HashMap`, since iteration order would
 break determinism.
 
@@ -100,27 +110,61 @@ iterated during placement.
 ### Which door next - `GenerationOrder` (`plugin/systems.rs`, `generator/frontier.rs`)
 
 - `NearestAnchor` (default): fill the open doors nearest any anchor first, up to
-  `ROOMS_PER_FRAME = 64` placements a frame. A count, not a time budget, so a fixed-seed
+  `PlacementBudget::nearest_anchor_rooms` (default 64) placements a frame. A count, not a time budget, so a fixed-seed
   run doesn't depend on machine speed. Same seed plus the same anchor route gives the
   same dungeon.
 - `FromOrigin` (deterministic): start at (0, 0) and always fill the open door nearest the
   origin, out to the furthest distance any anchor has travelled plus the generation
   radius. A lazy min-heap keyed by (distance², y, x, ids) always takes the global
   minimum, so any route and any per-frame budget replays a prefix of one fixed sequence:
-  same seed, same dungeon, every time. Budget: 2 ms a frame (`GENERATION_BUDGET`), with
-  `MAX_PLACEMENTS_PER_FRAME = 512` as a backstop. A failed attempt abandons the door at
-  once.
+  same seed, same dungeon, every time. Budget: `PlacementBudget::from_origin_time` (default
+  2 ms a frame), with `from_origin_max_rooms` (default 512) as a backstop.
 
-Under `NearestAnchor`, a door that keeps failing (`DEAD_DOOR_THRESHOLD = 300` attempts) is
-abandoned and reported with `DoorAbandoned`, so the game can wall it off.
+`PlacementBudget` is a resource (`GeneratorPlugin::with_placement_budget`), changeable at
+runtime.
+
+Under either order, a door whose attempt fails is abandoned at once and reported with
+`DoorAbandoned`, so the game can wall it off. Reservations guarantee every open door can
+take its cap room, so a failure only means the weights excluded every candidate that fits
+(a consumer table zeroing them, a quota, a depth gate), and a retry would fail the same
+way. Before reservations, doors failed temporarily while their neighbourhood was still
+growing, so `NearestAnchor` retried each one up to 300 times; that retry counter is gone.
+On the bundled map no attempt fails at all (end-to-end test, and the `meta` example's
+fixed-seed layout is identical before and after the change).
 
 ### Spawning - `sync_entities` (`plugin/systems.rs`)
 
 Queries the room index around each anchor (falling back to a scan when the query rect
 would cover more cells than there are rooms), and spawns the nearest unspawned rooms
-first, `ROOM_SPAWNS_PER_FRAME = 4` a frame. Spawning a tilemap is far more expensive than
-placing a room (~0.12 ms vs ~10 µs), which is why rooms are placed well ahead of the
-spawn ring and spawned in small batches.
+first, up to a per-frame budget counted in **tiles of room area**. Spawn cost follows tile
+count (`bevy_ecs_tilemap` makes one entity per tile), so a tile budget works the same for
+small and large rooms at any grid size. At least one room spawns per frame regardless.
+Spawning is far more expensive than placing (~2.6 µs per tile, ~0.1 ms for a typical
+16px room, vs ~10 µs to place one), which is why rooms are placed well ahead of the spawn
+ring.
+
+The budget (`SpawnBudget`) is `Adaptive { min_tiles: 32, max_tiles: 16384 }` by default,
+or `Fixed(tiles)`. Spawn cost doesn't land in `sync_entities` but over the next frames
+(level processing, tilemap meshing), so the adaptive budget is driven by frame time:
+
+- **Baseline:** an average of frame times while nothing has spawned for 3 frames. While
+  spawning, a faster frame pulls it down (smoothed, since vsync frame times jitter). It
+  only creeps up while frames run long with the budget already at its minimum, which
+  means the baseline itself is wrong (e.g. the window moved to a slower display).
+- **Long frame:** over the baseline by `max(30% + 1 ms, 4 ms)`. Under vsync that's a
+  missed refresh; without it, a few ms isn't a stutter.
+- **On a long frame:** the budget halves from what was actually spawned, and a ceiling is
+  set at 75% of it. The ceiling holds for 120 smooth frames, then lifts by 1% + 8 tiles a
+  frame, so a sustained load probes it at most every couple of seconds.
+- **Otherwise:** the budget grows by `max(12.5%, 32 tiles)`, up to the ceiling, but only if
+  the frame used at least half of it, so rooms trickling in don't inflate a budget the next
+  burst would then spend all at once.
+
+Simulated (unit tests, continuous loading): a fast machine without vsync settles at ~1180
+tiles/frame, a 3x slower one on 60 Hz at ~640 (of 833 possible), a 10x slower one at ~80
+(of 100), each with under 1% of frames running long; it recovers after the window moves
+from a 144 Hz display to a 60 Hz one. In the `testing` example on 60 Hz: ~180-390 rooms
+load in 0.07-0.12 s with no frame over 20 ms (the old fixed 4 rooms a frame took ~1.2 s).
 
 ### RNG and seeds
 

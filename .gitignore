@@ -15,3 +15,8 @@ result
 
 # LDtk writes backups next to a project when it saves.
 /assets/*/backups/
+
+# Local-only design notes
+/DESIGN.md
+/ARCHITECTURE.md
+/HANDOFF.md

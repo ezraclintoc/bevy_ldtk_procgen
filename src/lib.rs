@@ -31,7 +31,9 @@ pub mod plugin;
 
 /// Everything a consumer normally needs, in one `use`.
 pub mod prelude {
-    pub use crate::generator::catalog::{Catalog, CatalogError, FloatTagId, RoomDef, TagId};
+    pub use crate::generator::catalog::{
+        Catalog, CatalogError, DoorSource, FloatTagId, RoomDef, TagId,
+    };
     pub use crate::generator::error::CatalogErrors;
     pub use crate::generator::geom::{
         Dir, PlacementId, RoomId, TilePos, TileRect, TileSize, overlaps,
@@ -42,7 +44,8 @@ pub mod prelude {
     pub use crate::plugin::{
         CatalogRes, CullingPolicy, DoorAbandoned, GenerationAnchor, GenerationFailed,
         GenerationOrder, GenerationSeed, GenerationSet, GenerationSettled, GenerationState,
-        GeneratorPlugin, LayoutRes, OriginReach, Regenerate, RoomDespawned, RoomPlaced,
-        RoomSpawned, RoomWeights, StreamingRadii, apply_weights,
+        GeneratorPlugin, LayoutRes, OriginReach, PlacementBudget, Regenerate, RoomDespawned,
+        RoomPlaced, RoomSpawned, RoomWeights, SpawnBudget, SpawnRate, StreamingRadii,
+        apply_weights,
     };
 }

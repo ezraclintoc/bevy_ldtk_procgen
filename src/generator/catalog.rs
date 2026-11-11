@@ -68,6 +68,15 @@ pub enum CatalogError {
         /// The offending level.
         level: String,
     },
+    /// Door detection from IntGrid gaps (`DoorSource::IntGridGaps`) found an
+    /// empty corner cell. A corner belongs to two edges at once, so the
+    /// gap's direction is ambiguous; wall the corner off in the editor.
+    DoorAtCorner {
+        /// The offending level.
+        level: String,
+        /// The corner cell, in LDtk's y-down frame.
+        at: TilePos,
+    },
     /// A `Door` entity touches no level edge. Direction comes from the edge
     /// it sits on (`DESIGN.md` §2), so a door that touches none cannot be
     /// oriented — and inferring it from the entity's size is exactly the old
@@ -110,6 +119,26 @@ pub enum CatalogError {
         /// The asset system's own error, verbatim — it knows more about why
         /// the load failed than this crate can.
         message: String,
+    },
+}
+
+/// Where a room's doors come from.
+#[non_exhaustive]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum DoorSource {
+    /// `Door` entities flush against the level edge, on any Entities layer.
+    /// Doors can carry fields this way, and an author can leave a gap in a
+    /// wall that isn't a connection.
+    #[default]
+    Entities,
+    /// Every gap in the level's outer ring of an `IntGrid` layer is a door:
+    /// each maximal run of empty (`0`) cells along one edge, corners
+    /// excluded, is one door that wide. Any nonzero value is wall. No
+    /// `Door` entities needed, and doors can't drift out of sync with the
+    /// walls. `layer` is the IntGrid layer's identifier.
+    IntGridGaps {
+        /// The `IntGrid` layer whose gaps are doors, e.g. `"WallGrid"`.
+        layer: String,
     },
 }
 
@@ -344,9 +373,20 @@ impl Catalog {
     }
 }
 
-/// Parses and validates a whole LDtk project. See this file's module doc for
-/// why `&LdtkJson` is the input type, and for what "Strict" means here.
-pub fn build_catalog(project: &LdtkJson) -> Result<Catalog, CatalogErrors> {
+/// [`build_catalog_with`] for `Door` entities — what every test fixture
+/// uses. The plugin always goes through `build_catalog_with`.
+#[cfg(test)]
+pub(crate) fn build_catalog(project: &LdtkJson) -> Result<Catalog, CatalogErrors> {
+    build_catalog_with(project, &DoorSource::Entities)
+}
+
+/// Parses and validates a whole LDtk project, with doors found the way
+/// `doors` says. See this file's module doc for why `&LdtkJson` is the input
+/// type, and for what "Strict" means here.
+pub(crate) fn build_catalog_with(
+    project: &LdtkJson,
+    doors: &DoorSource,
+) -> Result<Catalog, CatalogErrors> {
     let mut errors = Vec::new();
 
     let Some(grid_size) = find_grid_size(project) else {
@@ -376,6 +416,7 @@ pub fn build_catalog(project: &LdtkJson) -> Result<Catalog, CatalogErrors> {
     for level in &project.levels {
         let (room, mut room_errors) = build_room(
             level,
+            doors,
             grid_size,
             tags_field_id.as_deref(),
             &bool_tag_names,
@@ -539,6 +580,7 @@ fn find_float_tag_field_names(project: &LdtkJson) -> Vec<String> {
 /// the caller discards this room if `room_errors` is non-empty.
 fn build_room(
     level: &Level,
+    source: &DoorSource,
     grid_size: i32,
     tags_field_id: Option<&str>,
     bool_tag_names: &[String],
@@ -564,7 +606,7 @@ fn build_room(
             level: level.identifier.clone(),
         }),
         Some(layers) => {
-            let mut found_entity_layer = false;
+            let mut found_door_layer = false;
             for layer in layers {
                 if layer.grid_size != grid_size {
                     errors.push(CatalogError::MixedGridSize {
@@ -573,20 +615,33 @@ fn build_room(
                         found: layer.grid_size,
                     });
                 }
-                if layer.layer_instance_type != LdtkLayerType::Entities {
-                    continue;
+                match source {
+                    DoorSource::Entities => {
+                        if layer.layer_instance_type != LdtkLayerType::Entities {
+                            continue;
+                        }
+                        found_door_layer = true;
+                        collect_doors(
+                            layer,
+                            level,
+                            grid_size,
+                            height_tiles,
+                            &mut doors,
+                            &mut errors,
+                        );
+                    }
+                    DoorSource::IntGridGaps { layer: name } => {
+                        if layer.layer_instance_type != LdtkLayerType::IntGrid
+                            || layer.identifier != *name
+                        {
+                            continue;
+                        }
+                        found_door_layer = true;
+                        collect_gap_doors(layer, level, size, &mut doors, &mut errors);
+                    }
                 }
-                found_entity_layer = true;
-                collect_doors(
-                    layer,
-                    level,
-                    grid_size,
-                    height_tiles,
-                    &mut doors,
-                    &mut errors,
-                );
             }
-            if !found_entity_layer {
+            if !found_door_layer {
                 errors.push(CatalogError::DoorLayerMissing {
                     level: level.identifier.clone(),
                 });
@@ -635,6 +690,95 @@ fn collect_doors(
                 },
             }),
         }
+    }
+}
+
+/// `DoorSource::IntGridGaps`: one door per maximal run of empty cells along
+/// each edge, in N, E, S, W order and along each edge in increasing `LDtk`
+/// x or y, so door indices are stable for a given project.
+fn collect_gap_doors(
+    layer: &LayerInstance,
+    level: &Level,
+    size: TileSize,
+    doors: &mut Vec<DoorDef>,
+    errors: &mut Vec<CatalogError>,
+) {
+    let (w, h) = (layer.c_wid, layer.c_hei);
+    // Out of range reads as wall: a short CSV can't invent a door.
+    let open = |x: i32, y: i32| {
+        usize::try_from(y * w + x)
+            .ok()
+            .and_then(|i| layer.int_grid_csv.get(i))
+            .is_some_and(|v| *v == 0)
+    };
+    if w < 1 || h < 1 {
+        return;
+    }
+    for (x, y) in [(0, 0), (w - 1, 0), (w - 1, h - 1), (0, h - 1)] {
+        if open(x, y) {
+            errors.push(CatalogError::DoorAtCorner {
+                level: level.identifier.clone(),
+                at: TilePos { x, y },
+            });
+        }
+    }
+    let height = i32::try_from(size.height).unwrap_or(0);
+    // Runs of open cells at 1..len-1 along an edge: (first index, length).
+    let runs = |len: i32, open_at: &dyn Fn(i32) -> bool| {
+        let mut out = Vec::new();
+        let mut start = None;
+        for i in 1..len {
+            match (start, i < len - 1 && open_at(i)) {
+                (None, true) => start = Some(i),
+                (Some(s), false) => {
+                    out.push((s, i - s));
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        out
+    };
+    // Clamped like `build_door`: no real catalog has a 255-tile door.
+    let width = |run: i32| u8::try_from(run.clamp(1, i32::from(u8::MAX))).unwrap_or(1);
+    for (start, run) in runs(w, &|x| open(x, 0)) {
+        doors.push(DoorDef {
+            local_pos: TilePos {
+                x: start,
+                y: height - 1,
+            },
+            dir: Dir::N,
+            width: width(run),
+        });
+    }
+    // E/W: LDtk rows run top-down, so the run's min corner in the y-up frame
+    // is its *last* row — same flip as `build_door`.
+    for (start, run) in runs(h, &|y| open(w - 1, y)) {
+        doors.push(DoorDef {
+            local_pos: TilePos {
+                x: w - 1,
+                y: height - start - run,
+            },
+            dir: Dir::E,
+            width: width(run),
+        });
+    }
+    for (start, run) in runs(w, &|x| open(x, h - 1)) {
+        doors.push(DoorDef {
+            local_pos: TilePos { x: start, y: 0 },
+            dir: Dir::S,
+            width: width(run),
+        });
+    }
+    for (start, run) in runs(h, &|y| open(0, y)) {
+        doors.push(DoorDef {
+            local_pos: TilePos {
+                x: 0,
+                y: height - start - run,
+            },
+            dir: Dir::W,
+            width: width(run),
+        });
     }
 }
 
@@ -923,5 +1067,68 @@ mod tests {
         assert!(catalog.rooms_with_door_facing(Dir::E).contains(&spawn_1_id));
         assert!(catalog.rooms_with_door_facing(Dir::S).contains(&spawn_1_id));
         assert!(!catalog.rooms_with_door_facing(Dir::W).contains(&spawn_1_id));
+    }
+
+    fn gap_source() -> DoorSource {
+        DoorSource::IntGridGaps {
+            layer: "WallGrid".to_owned(),
+        }
+    }
+
+    /// The bundled map has both: `Door` entities and a `WallGrid` with a gap
+    /// under each one. Reading either must give the same doors, room by room.
+    #[test]
+    fn intgrid_gaps_find_the_same_doors_as_entities() {
+        let project = load_kenney_catalog();
+        let entities = build_catalog(&project).unwrap();
+        let gaps = build_catalog_with(&project, &gap_source()).unwrap();
+        assert_eq!(entities.len(), gaps.len());
+        for (a, b) in entities.iter().zip(gaps.iter()) {
+            let sorted = |d: &RoomDef| {
+                let mut v: Vec<_> = d
+                    .doors
+                    .iter()
+                    .map(|d| (d.dir as u8, d.local_pos.x, d.local_pos.y, d.width))
+                    .collect();
+                v.sort_unstable();
+                v
+            };
+            assert_eq!(sorted(a), sorted(b), "level {}", a.identifier);
+        }
+    }
+
+    #[test]
+    fn intgrid_open_corner_is_an_error_naming_the_level() {
+        let mut project = load_kenney_catalog();
+        let level = project.levels.first_mut().unwrap();
+        let name = level.identifier.clone();
+        let layer = level
+            .layer_instances
+            .as_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|l| l.identifier == "WallGrid")
+            .unwrap();
+        *layer.int_grid_csv.first_mut().unwrap() = 0;
+        let errors = build_catalog_with(&project, &gap_source()).unwrap_err();
+        assert!(errors.0.iter().any(|e| matches!(
+            e,
+            CatalogError::DoorAtCorner { level, at: TilePos { x: 0, y: 0 } } if *level == name
+        )));
+    }
+
+    #[test]
+    fn intgrid_missing_layer_is_reported() {
+        let project = load_kenney_catalog();
+        let source = DoorSource::IntGridGaps {
+            layer: "NoSuchLayer".to_owned(),
+        };
+        let errors = build_catalog_with(&project, &source).unwrap_err();
+        assert!(
+            errors
+                .0
+                .iter()
+                .any(|e| matches!(e, CatalogError::DoorLayerMissing { .. }))
+        );
     }
 }

@@ -30,6 +30,8 @@ FPS is capped by the recording monitor's 60 Hz vsync.*
 
 - Catalog built from an LDtk project: rooms, doors (direction from the level
   edge, any width the art uses), bool and float tags, per-room weights.
+- Doors from `Door` entities, or found automatically from the gaps in an
+  IntGrid wall layer (`with_door_source(DoorSource::IntGridGaps { layer })`).
 - Synchronous generation in a per-frame budget, with the layout as the single
   source of truth.
 - Door-to-door placement with door reservations: every open door keeps the
@@ -46,7 +48,8 @@ FPS is capped by the recording monitor's 60 Hz vsync.*
   despawn. The spawn/despawn gap is enforced, so no setting can load and
   unload a room on alternate frames.
 - Streaming: rooms spawn near a `GenerationAnchor`, nearest first, and are
-  culled behind it without ever mutating the layout.
+  culled behind it without ever mutating the layout. The spawn budget adapts
+  to each machine's frame time (or is fixed, if you prefer).
 - Every dungeon has a reportable seed (`GenerationSeed`), random ones
   included.
 - Meta-generation: a consumer weight table plus engine-side quotas, depth
@@ -63,8 +66,6 @@ FPS is capped by the recording monitor's 60 Hz vsync.*
 - An 18px project. The crate is grid-agnostic and the 512px Mossy Cavern map
   is tested locally (its art can't be redistributed), but no 18px map exists
   yet.
-- `GenerationBudget` configuration (currently fixed: 64 rooms a frame for
-  `NearestAnchor`, 2 ms a frame for `FromOrigin`, 4 room spawns a frame).
 - Tag transition table wiring (`WeightConfig::tag_transition`).
 - Saving and loading a layout.
 - Hot reload of the `.ldtk` project.
@@ -90,7 +91,7 @@ fn main() {
 }
 ```
 
-Builder options: `with_generation_radius`, `with_culling`, `with_order`,
+Builder options: `with_generation_radius`, `with_culling`, `with_order`, `with_placement_budget`, `with_spawn_budget`, `with_door_source`,
 `with_start`, `with_max_rooms`, `with_weight_config`.
 
 ## Examples
@@ -116,11 +117,15 @@ Release build, bundled 16px catalog:
 | | |
 |---|---|
 | Placing a room (layout data only) | ~9.5 µs, flat from 10k to 100k rooms |
-| Spawning a room (`bevy_ecs_ldtk` tilemaps) | ~0.12 ms, plus a fixed cost per burst |
+| Spawning a room (`bevy_ecs_ldtk` tilemaps) | ~2.6 µs per tile (~0.1 ms for a typical room) |
+| Loading ~300 rooms after a teleport | 0.07-0.12 s, no frame over 20 ms (60 Hz) |
 | Generator share of a frame while streaming | under 0.2 ms of 7 ms |
 
 Placement is cheap and spawning is not, so the defaults place rooms well ahead
-of what is loaded and spawn only a few per frame, nearest first. The placement
+of what is loaded and spawn them nearest first, within a per-frame budget that
+adapts to the machine: it learns the normal frame time and spawns as much as
+fits without a visible stutter, so a slow laptop loads rooms more slowly
+instead of hitching (`SpawnBudget`; `SpawnRate` shows where it settled). The placement
 benchmark: `cargo test --release --lib bench_ -- --ignored --nocapture`.
 
 ## Installation

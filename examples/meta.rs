@@ -75,6 +75,7 @@ fn main() {
                 .with_seed(424242)
                 .with_max_rooms(CEILING, CountBy::All),
         )
+        .init_resource::<Phase>()
         .add_systems(Startup, (spawn_camera, spawn_hud))
         .add_systems(
             Update,

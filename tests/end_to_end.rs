@@ -88,8 +88,8 @@ fn move_anchor(
     *moved = true;
 }
 
-#[test]
-fn streaming_generation_runs_end_to_end() {
+/// The headless app every test here drives, with `plugin` as the generator.
+fn headless_app(plugin: GeneratorPlugin) -> App {
     let mut app = App::new();
 
     // Headless stand-in for DefaultPlugins: task pools (asset I/O), assets,
@@ -107,17 +107,21 @@ fn streaming_generation_runs_end_to_end() {
     app.init_asset::<TextureAtlasLayout>();
     app.insert_resource(ClearColor::default())
         .add_plugins(LdtkPlugin)
-        .add_plugins(
-            GeneratorPlugin::new("ezraclintoc_kenney-tiny-dungeon_16px_notileset.ldtk", 800.0)
-                .with_seed(1234),
-        )
-        .init_resource::<Observed>()
-        .add_systems(Update, (record_events, move_anchor));
-
+        .add_plugins(plugin);
     // The anchor is the camera in the real examples; here just a transform
     // at the origin. GlobalTransform arrives via required components.
     app.world_mut()
         .spawn((Transform::default(), GenerationAnchor));
+    app
+}
+
+const MAP: &str = "ezraclintoc_kenney-tiny-dungeon_16px_notileset.ldtk";
+
+#[test]
+fn streaming_generation_runs_end_to_end() {
+    let mut app = headless_app(GeneratorPlugin::new(MAP, 800.0).with_seed(1234));
+    app.init_resource::<Observed>()
+        .add_systems(Update, (record_events, move_anchor));
 
     // Plenty of frames for: load (a few), catalog build, start room, then
     // streaming fills and spawns (throttled per frame by design).
@@ -261,4 +265,47 @@ fn streaming_generation_runs_end_to_end() {
         open_doors > 0,
         "a streaming dungeon must still have open doors ahead of the anchor"
     );
+}
+
+/// Room area (tiles) of the room roots spawned each frame.
+#[derive(Resource, Default)]
+struct SpawnedPerFrame(Vec<Vec<u32>>);
+
+fn record_spawn_area(
+    added: Query<&Name, Added<LevelSet>>,
+    catalog: Res<CatalogRes>,
+    mut frames: ResMut<SpawnedPerFrame>,
+) {
+    let areas = added
+        .iter()
+        .filter_map(|name| catalog.iter().find(|d| d.identifier == name.as_str()))
+        .map(|d| d.size.width * d.size.height)
+        .collect();
+    frames.0.push(areas);
+}
+
+#[test]
+fn fixed_spawn_budget_caps_tiles_per_frame() {
+    const BUDGET: u32 = 100;
+    let mut app = headless_app(
+        GeneratorPlugin::new(MAP, 800.0)
+            .with_seed(1234)
+            .with_spawn_budget(SpawnBudget::Fixed(BUDGET)),
+    );
+    app.init_resource::<SpawnedPerFrame>()
+        .add_systems(Last, record_spawn_area);
+    for _ in 0..300 {
+        app.update();
+    }
+    let frames = &app.world().resource::<SpawnedPerFrame>().0;
+    let total: usize = frames.iter().map(Vec::len).sum();
+    assert!(total > 20, "rooms must keep spawning, got {total}");
+    for areas in frames {
+        let sum: u32 = areas.iter().sum();
+        assert!(
+            sum <= BUDGET || areas.len() == 1,
+            "frame spawned {areas:?} = {sum} tiles over a {BUDGET}-tile budget"
+        );
+    }
+    assert_eq!(app.world().resource::<SpawnRate>().tiles_per_frame, BUDGET);
 }

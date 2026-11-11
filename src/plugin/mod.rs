@@ -10,7 +10,7 @@ pub(crate) mod events;
 pub(crate) mod load;
 pub(crate) mod systems;
 
-use crate::generator::catalog::Catalog;
+use crate::generator::catalog::{Catalog, DoorSource};
 use crate::generator::layout::Layout;
 use crate::generator::place::StartRoom;
 use crate::generator::weight::CountBy;
@@ -19,7 +19,7 @@ pub use events::{
     RoomSpawned,
 };
 pub use load::GenerationState;
-use systems::{DoorAttempts, GenRng, GenerationConfig, PlacementCountersRes};
+use systems::{GenRng, GenerationConfig, PlacementCountersRes};
 pub use systems::{RoomWeights, apply_weights};
 
 /// The loaded catalog, behind an `Arc` so it is cheap to share and impossible
@@ -191,6 +191,91 @@ pub enum GenerationOrder {
     FromOrigin,
 }
 
+/// How much placement (Layout data, no entities) each frame may do. Placing
+/// a room costs ~10 µs whatever the dungeon's size, so these mostly decide
+/// how fast generation keeps up with a fast-moving anchor. A resource, so
+/// it can change at runtime, e.g. raised behind a loading screen.
+///
+/// The two orders are budgeted differently on purpose. Under
+/// [`GenerationOrder::NearestAnchor`] the anchor moves between frames, so
+/// how many rooms a frame places changes which doors are nearest next: a
+/// time budget would make a fixed-seed run depend on machine speed, so it
+/// is a count. [`GenerationOrder::FromOrigin`]'s sequence doesn't depend on
+/// how many rooms each frame gets through, so it can use time.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacementBudget {
+    /// Rooms placed per frame at most under `NearestAnchor`. Default 64
+    /// (~0.6 ms here).
+    pub nearest_anchor_rooms: usize,
+    /// Time spent placing per frame under `FromOrigin`. Default 2 ms
+    /// (~200 rooms here), enough for the disc to keep up with a fast
+    /// anchor.
+    pub from_origin_time: std::time::Duration,
+    /// Rooms placed per frame at most under `FromOrigin`, alongside the
+    /// time budget, so a coarse clock can't let one frame run away.
+    /// Default 512.
+    pub from_origin_max_rooms: usize,
+}
+
+impl Default for PlacementBudget {
+    fn default() -> Self {
+        Self {
+            nearest_anchor_rooms: 64,
+            from_origin_time: std::time::Duration::from_millis(2),
+            from_origin_max_rooms: 512,
+        }
+    }
+}
+
+/// How much tilemap the plugin may spawn per frame, counted in tiles of room
+/// area: spawning a room costs in proportion to its tiles
+/// (`bevy_ecs_tilemap` makes one entity per tile), so a tile budget treats a
+/// project of small rooms and one of large rooms alike, whatever the grid
+/// size. Nearest rooms spawn first; a room bigger than the whole budget still
+/// spawns, alone.
+///
+/// The cost is per machine (~2.6 µs a tile on the machine the defaults were
+/// measured on), which is why the default adapts. A resource, so it can
+/// change at runtime, e.g. a large fixed budget behind a loading screen.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnBudget {
+    /// Learn what this machine can afford. The plugin tracks the normal
+    /// frame time while nothing is spawning; while spawning, it raises the
+    /// budget as long as frames stay near that, and halves it when a frame
+    /// runs long (a missed vsync, or ~30% over the baseline), remembering a
+    /// ceiling just below the level that caused it. A slow machine loads
+    /// rooms more slowly instead of stuttering; a fast one loads them
+    /// sooner. [`SpawnRate`] shows the current value.
+    Adaptive {
+        /// Never below this, however slow frames get. At least one room
+        /// spawns each frame regardless, so the dungeon always keeps
+        /// loading.
+        min_tiles: u32,
+        /// Never above this.
+        max_tiles: u32,
+    },
+    /// Exactly this many tiles a frame, whatever it costs.
+    Fixed(u32),
+}
+
+impl Default for SpawnBudget {
+    fn default() -> Self {
+        Self::Adaptive {
+            min_tiles: 32,
+            max_tiles: 16_384,
+        }
+    }
+}
+
+/// The spawn budget in effect this frame, in tiles: the fixed value, or
+/// where [`SpawnBudget::Adaptive`] has settled. Maintained by the plugin;
+/// read it, don't write it.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpawnRate {
+    /// Tiles of room area spawned per frame at most.
+    pub tiles_per_frame: u32,
+}
+
 /// The seed the current dungeon is generated from — the one passed to
 /// [`GeneratorPlugin::with_seed`] or [`Regenerate`], or, when none was, the
 /// random one the plugin drew. Every dungeon has one, so any dungeon can be
@@ -255,6 +340,9 @@ pub struct GeneratorPlugin {
     start: StartRoom,
     culling: CullingPolicy,
     order: GenerationOrder,
+    placement_budget: PlacementBudget,
+    spawn_budget: SpawnBudget,
+    door_source: DoorSource,
     weight_config: crate::generator::weight::WeightConfig,
 }
 
@@ -281,6 +369,9 @@ impl GeneratorPlugin {
             start: StartRoom::default(),
             culling: CullingPolicy::radius(view_radius),
             order: GenerationOrder::default(),
+            placement_budget: PlacementBudget::default(),
+            spawn_budget: SpawnBudget::default(),
+            door_source: DoorSource::default(),
             weight_config: Default::default(),
         }
     }
@@ -332,6 +423,27 @@ impl GeneratorPlugin {
         self
     }
 
+    /// How much placement each frame may do (see [`PlacementBudget`]).
+    pub fn with_placement_budget(mut self, budget: PlacementBudget) -> Self {
+        self.placement_budget = budget;
+        self
+    }
+
+    /// How much tilemap to spawn per frame (see [`SpawnBudget`]). Defaults
+    /// to adapting to the machine.
+    pub fn with_spawn_budget(mut self, budget: SpawnBudget) -> Self {
+        self.spawn_budget = budget;
+        self
+    }
+
+    /// Where room doors come from: `Door` entities
+    /// ([`DoorSource::Entities`], the default) or gaps in an `IntGrid` wall
+    /// layer ([`DoorSource::IntGridGaps`]).
+    pub fn with_door_source(mut self, source: DoorSource) -> Self {
+        self.door_source = source;
+        self
+    }
+
     /// Culling policy (DESIGN.md §8). Defaults to
     /// `CullingPolicy::radius(view_radius)`.
     pub fn with_culling(mut self, culling: CullingPolicy) -> Self {
@@ -361,6 +473,7 @@ impl Plugin for GeneratorPlugin {
             .insert_resource(GenerationSeed(seed))
             .insert_resource(GenRng::new(seed))
             .insert_resource(GenerationConfig {
+                door_source: self.door_source.clone(),
                 max_rooms: self.max_rooms.clone(),
                 start: self.start.clone(),
                 weight_config: self.weight_config.clone(),
@@ -371,11 +484,14 @@ impl Plugin for GeneratorPlugin {
                 culling: self.culling,
             })
             .insert_resource(self.order)
+            .insert_resource(self.placement_budget)
+            .insert_resource(self.spawn_budget)
+            .init_resource::<SpawnRate>()
+            .init_resource::<systems::SpawnController>()
             .init_resource::<OriginReach>()
             .init_resource::<systems::OriginFrontierRes>()
             .init_resource::<systems::SpawnCursor>()
             .init_resource::<RoomWeights>()
-            .init_resource::<DoorAttempts>()
             .init_resource::<PlacementCountersRes>()
             .init_resource::<CatalogRes>()
             .init_resource::<LayoutRes>()
