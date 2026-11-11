@@ -10,6 +10,14 @@ non-linear layout at runtime — no hand-authored dungeon required.
 > [!WARNING]
 > **Pre-alpha.** Public API changes without notice.
 
+![The testing example: a corridor maze streaming around the camera, then a deterministic dungeon growing as a disc from the origin](media/demo.gif)
+
+*`cargo run --release --example testing`, halls mode, seed 102. First half: the
+default order, filling doors nearest the camera. Second half: deterministic
+order, a disc grown from the origin at ~4,000 rooms/s; only rooms inside the
+green ring are spawned. The HUD shows rooms placed per frame and per second.
+FPS is capped by the recording monitor's 60 Hz vsync.*
+
 ## Compatibility
 
 | `bevy_ldtk_procgen` | `bevy` | `bevy_ecs_ldtk` |
@@ -22,26 +30,98 @@ non-linear layout at runtime — no hand-authored dungeon required.
 
 - Catalog built from an LDtk project: rooms, doors (direction from the level
   edge, any width the art uses), bool and float tags, per-room weights.
-- Synchronous, seed-reproducible generation in a per-frame budget, with the
-  layout as the single source of truth.
-- Door-to-door placement with clearance-strip validation, so a door can never
-  be sealed or born facing another room's interior.
-- Streaming: rooms spawn near a `GenerationAnchor` and are culled behind it
-  without ever mutating the layout.
+- Synchronous generation in a per-frame budget, with the layout as the single
+  source of truth.
+- Door-to-door placement with door reservations: every open door keeps the
+  full footprint of a room that could fill it free, so a door can never be
+  sealed, two open doors never compete for the same space, and no door is
+  born facing another room's wall.
+- Spatially indexed rooms *and* open doors, so placement cost stays flat as
+  the dungeon grows (~9.5 µs per room out to 100,000 rooms).
+- Two door orders (`GenerationOrder`): `NearestAnchor` (default) fills
+  around the anchor; `FromOrigin` is **deterministic** — the same seed gives the
+  same dungeon however it was explored and however fast each frame ran.
+- Three independently configurable rings (`StreamingRadii`, changeable at
+  runtime): generation (rooms placed as data, ahead of the player), spawn and
+  despawn. The spawn/despawn gap is enforced, so no setting can load and
+  unload a room on alternate frames.
+- Streaming: rooms spawn near a `GenerationAnchor`, nearest first, and are
+  culled behind it without ever mutating the layout.
+- Every dungeon has a reportable seed (`GenerationSeed`), random ones
+  included.
 - Meta-generation: a consumer weight table plus engine-side quotas, depth
   gates, closure bias and multi-door preference.
-- Regeneration on demand (`Regenerate`), with an optional fixed seed.
+- Regeneration on demand (`Regenerate`), with a fresh or a given seed.
+- Authoring feedback at load: missing cap rooms are an error naming the
+  direction; doors too close together for their rooms to fit are a warning
+  naming the level and doors.
 - Point → room queries, connectivity via open doors, and events for every
   placement, spawn, despawn, abandoned door and catalog failure.
 
 ### Planned
 
-- Tile-size coverage beyond 16px in the examples (the crate itself is
-  grid-agnostic; the 18px and 512px catalogs are test-only today).
-- `GenerationBudget` configuration (currently a fixed per-frame room cap).
+- An 18px project. The crate is grid-agnostic and the 512px Mossy Cavern map
+  is tested locally (its art can't be redistributed), but no 18px map exists
+  yet.
+- `GenerationBudget` configuration (currently fixed: 64 rooms a frame for
+  `NearestAnchor`, 2 ms a frame for `FromOrigin`, 4 room spawns a frame).
 - Tag transition table wiring (`WeightConfig::tag_transition`).
 - Saving and loading a layout.
 - Hot reload of the `.ldtk` project.
+
+## Quick start
+
+```rust
+use bevy::prelude::*;
+use bevy_ecs_ldtk::prelude::*;
+use bevy_ldtk_procgen::prelude::*;
+
+fn main() {
+    App::new()
+        .add_plugins((DefaultPlugins, LdtkPlugin))
+        // Rooms load within 800 px of the anchor, are placed out to 1600 px,
+        // and unload beyond 1000 px.
+        .add_plugins(GeneratorPlugin::new("my_rooms.ldtk", 800.0).with_seed(1234))
+        .add_systems(Startup, |mut commands: Commands| {
+            // Generation follows whatever carries the anchor.
+            commands.spawn((Camera2d, GenerationAnchor));
+        })
+        .run();
+}
+```
+
+Builder options: `with_generation_radius`, `with_culling`, `with_order`,
+`with_start`, `with_max_rooms`, `with_weight_config`.
+
+## Examples
+
+```bash
+cargo run --release --example <name> [-- <map.ldtk>]   # map path relative to assets/
+```
+
+| Example | Shows |
+|---|---|
+| `minimal` | The output API: placement/spawn events and point → room queries. |
+| `halls` | A player with wall collision in an endless corridor maze (a consumer weight table). |
+| `meta` | Meta-generation: a bounded dungeon that closes off gracefully. |
+| `testing` | The debug harness in the video: rings, room bounds, door reservations, FPS and throughput, halls and deterministic toggles. F1 opens the menu. |
+
+All examples: **WASD** moves, **R** regenerates with a new seed, **Shift+R**
+regenerates the same seed.
+
+## Performance
+
+Release build, bundled 16px catalog:
+
+| | |
+|---|---|
+| Placing a room (layout data only) | ~9.5 µs, flat from 10k to 100k rooms |
+| Spawning a room (`bevy_ecs_ldtk` tilemaps) | ~0.12 ms, plus a fixed cost per burst |
+| Generator share of a frame while streaming | under 0.2 ms of 7 ms |
+
+Placement is cheap and spawning is not, so the defaults place rooms well ahead
+of what is loaded and spawn only a few per frame, nearest first. The placement
+benchmark: `cargo test --release --lib bench_ -- --ignored --nocapture`.
 
 ## Installation
 
@@ -68,16 +148,17 @@ nix develop
 
 ### Bundled assets
 
-`assets/kenney_tiny-dungeon_16px.png` is CC0 and ships with the repo. The Mossy Cavern
-tileset is not redistributable, so it is **not** in this repository — the matching
-`.ldtk` map is, but it will fail to load until you supply the image yourself:
+`assets/kenney_tiny-dungeon_16px.png` is CC0 and ships with the repo, along with
+the 16px project the examples use.
 
-1. Download [Mossy Cavern](https://maaot.itch.io/mossy-cavern) by Maaot (name your own
-   price, free is fine).
-2. Place the 512px tileset at `assets/maaot_mossy-cavern_512px.png`.
-
-The path matters — `assets/ezraclintoc_maaot-mossy-cavern_512px_variabledoors.ldtk`
-refers to it by that exact filename.
+The Mossy Cavern tileset is not redistributable, so neither it nor the 512px map
+built on it is in this repository; both are kept local and gitignored. To build
+your own map on it, download [Mossy Cavern](https://maaot.itch.io/mossy-cavern) by
+Maaot (name your own price, free is fine) and place the 512px tileset at
+`assets/maaot_mossy-cavern_512px.png`. The 512px test
+(`local_512px_map_keeps_door_invariants`) runs when
+`assets/ezraclintoc_maaot-mossy-cavern_512px_variabledoors.ldtk` is present and
+skips otherwise.
 
 ## Contributing
 
