@@ -7,20 +7,20 @@ use std::hash::Hash;
 use super::geom::TileRect;
 
 #[derive(Debug, Clone)]
-pub struct SpatialHash<T> {
+pub(crate) struct SpatialHash<T> {
     cell_size: u32,
     cells: HashMap<(i32, i32), Vec<T>>,
 }
 
 impl<T: Copy> SpatialHash<T> {
-    pub fn new(cell_size: u32) -> Self {
+    pub(crate) fn new(cell_size: u32) -> Self {
         Self {
             cell_size,
             cells: HashMap::new(),
         }
     }
 
-    pub fn insert(&mut self, rect: TileRect, value: T) {
+    pub(crate) fn insert(&mut self, rect: TileRect, value: T) {
         for cell in cells_touching(self.cell_size, rect) {
             self.cells.entry(cell).or_default().push(value);
         }
@@ -30,7 +30,7 @@ impl<T: Copy> SpatialHash<T> {
 impl<T: Copy + PartialEq> SpatialHash<T> {
     /// Undoes one `insert(rect, value)`. `rect` must be the rect it was
     /// inserted with — that is what names the cells to look in.
-    pub fn remove(&mut self, rect: TileRect, value: T) {
+    pub(crate) fn remove(&mut self, rect: TileRect, value: T) {
         for cell in cells_touching(self.cell_size, rect) {
             if let Some(values) = self.cells.get_mut(&cell) {
                 values.retain(|v| *v != value);
@@ -59,7 +59,7 @@ fn cells_touching(cell_size: u32, rect: TileRect) -> impl Iterator<Item = (i32, 
 }
 
 impl<T: Copy + Eq + Hash> SpatialHash<T> {
-    pub fn query(&self, rect: TileRect) -> Vec<T> {
+    pub(crate) fn query(&self, rect: TileRect) -> Vec<T> {
         let mut seen = HashSet::new();
         let mut out = Vec::new();
         for cell in cells_touching(self.cell_size, rect) {

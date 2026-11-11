@@ -304,7 +304,7 @@ pub struct OriginReach {
 /// Either a path to load via `AssetServer` (the common case — see this
 /// file's `GeneratorPlugin::new`) or an already-loaded handle (for a
 /// consumer that wants to control preloading — `GeneratorPlugin::from_handle`).
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum ProjectSource {
     Path(String),
     Handle(Handle<LdtkProject>),
@@ -332,6 +332,7 @@ pub(crate) struct ProjectSourceRes(pub ProjectSource);
 /// Requires `LdtkPlugin` and an asset pipeline (`DefaultPlugins`); it no
 /// longer requires them to be added *before* it, and reports their absence
 /// rather than panicking.
+#[derive(Debug)]
 pub struct GeneratorPlugin {
     source: ProjectSource,
     generation_radius: f32,

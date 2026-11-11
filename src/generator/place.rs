@@ -44,7 +44,7 @@ use crate::generator::geom::OpenDoorId;
 /// frame weight table, short entries falling back to the
 /// room's base weight.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct WeightParams<'a> {
+pub(crate) struct WeightParams<'a> {
     pub table: Option<&'a [f32]>,
     pub ctx: Option<WeightContext<'a>>,
     pub ceiling: Option<usize>,
@@ -213,7 +213,7 @@ fn sample_weighted<R: RngExt>(rng: &mut R, weights: &[f32]) -> Option<usize> {
 /// one full attempt in ARCHITECTURE.md §4's terms, not a permanent failure;
 /// deciding whether to retry, and how many attempts before giving up on the
 /// door, is the caller's job (this file's module doc).
-pub fn attempt_door<R: RngExt>(
+pub(crate) fn attempt_door<R: RngExt>(
     layout: &mut Layout,
     catalog: &Catalog,
     door_id: OpenDoorId,
@@ -518,7 +518,7 @@ fn admitted<'a>(catalog: &'a Catalog, start: &StartRoom) -> Vec<(RoomId, &'a Roo
 /// `NoStartRoomMatched` is conditional exactly as DESIGN.md §2 says: under
 /// `StartRoom::Any` the candidate pool is the whole catalog, so the error
 /// only arises when a `Tagged`/`Named` constraint matches nothing.
-pub fn place_start_room<R: RngExt>(
+pub(crate) fn place_start_room<R: RngExt>(
     layout: &mut Layout,
     catalog: &Catalog,
     start: &StartRoom,

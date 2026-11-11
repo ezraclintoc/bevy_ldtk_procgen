@@ -38,7 +38,7 @@ use super::{
 /// every candidate weighs its base weight only.
 ///
 /// [`apply_weights`]: crate::prelude::apply_weights
-#[derive(Resource, Default, Deref, DerefMut)]
+#[derive(Resource, Debug, Default, Deref, DerefMut)]
 pub struct RoomWeights(pub Option<Vec<f32>>);
 
 /// The pipe target consumers attach their weight system to:

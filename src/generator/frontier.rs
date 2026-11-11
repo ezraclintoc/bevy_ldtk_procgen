@@ -33,7 +33,7 @@ type Key = (i64, i32, i32, u32, u8);
 /// generation puts its first room — nearest first. Lazy: newly opened doors are ingested from the Layout on demand,
 /// closed ones are discarded when they surface.
 #[derive(Debug, Clone, Default)]
-pub struct OriginFrontier {
+pub(crate) struct OriginFrontier {
     heap: BinaryHeap<Reverse<Key>>,
     /// Placements whose doors are already in `heap`. Doors only ever open
     /// when their own placement commits, so new placements are the only
@@ -46,7 +46,7 @@ impl OriginFrontier {
     /// tiles; `None` otherwise (or with no open doors). Peeks, not pops: the
     /// door stays the answer until it is closed, by a successful placement
     /// or by abandoning it.
-    pub fn next(
+    pub(crate) fn next(
         &mut self,
         layout: &Layout,
         catalog: &Catalog,

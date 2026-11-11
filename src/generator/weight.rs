@@ -97,7 +97,7 @@ impl WeightConfig {
 /// `WeightConfig` with every name resolved — what the placement loop reads.
 /// Built once at catalog load; immutable afterwards.
 #[derive(Debug, Clone, Default)]
-pub struct ResolvedWeights {
+pub(crate) struct ResolvedWeights {
     pub tag_max: Vec<(TagId, usize)>,
     pub tag_min_depth: Vec<(TagId, u32)>,
     pub prefer_multi_door: bool,
@@ -107,7 +107,7 @@ pub struct ResolvedWeights {
 /// built-ins and (as a snapshot, if ever needed) by consumers.
 /// Field semantics per DESIGN.md §9.
 #[derive(Debug, Clone, Default)]
-pub struct PlacementCounters {
+pub(crate) struct PlacementCounters {
     pub placed_total: usize,
     /// One slot per `TagId` — not a `HashMap` — the entire reason bool tags
     /// are interned.
@@ -122,7 +122,7 @@ pub struct PlacementCounters {
 
 impl PlacementCounters {
     /// Sized to the catalog's `TagId` space — the whole point of interning.
-    pub fn new(catalog: &Catalog) -> Self {
+    pub(crate) fn new(catalog: &Catalog) -> Self {
         Self {
             tag_counts: vec![0; catalog.tag_count()],
             rooms_since_tag: vec![0; catalog.tag_count()],
@@ -138,7 +138,12 @@ impl PlacementCounters {
     ///
     /// This is a hot-path-friendly bulk op: three field updates per tag.
     #[allow(clippy::too_many_arguments)]
-    pub fn record(&mut self, tag_count: usize, carried: impl Fn(usize) -> bool, progresses: bool) {
+    pub(crate) fn record(
+        &mut self,
+        tag_count: usize,
+        carried: impl Fn(usize) -> bool,
+        progresses: bool,
+    ) {
         self.placed_total += 1;
         if progresses {
             self.progress += 1;
@@ -159,7 +164,7 @@ impl PlacementCounters {
 /// how many currently-open doors placing it would close (the multi-door
 /// bonus's input).
 #[derive(Debug, Clone, Copy)]
-pub struct Candidate {
+pub(crate) struct Candidate {
     /// Kept on the candidate so future adjustments (e.g. anti-repeat via
     /// `recent_templates`) can key on it without changing every call site.
     #[allow(dead_code)]
@@ -170,7 +175,7 @@ pub struct Candidate {
 
 /// Everything the per-placement weight adjustment needs.
 #[derive(Debug, Clone, Copy)]
-pub struct WeightContext<'a> {
+pub(crate) struct WeightContext<'a> {
     pub resolved: &'a ResolvedWeights,
     pub counters: &'a PlacementCounters,
 }
@@ -363,7 +368,7 @@ mod tests {
 /// Single-door caps keep full weight while high-door rooms collapse — the
 /// frontier shrinks as the ceiling approaches instead of being cut off
 /// mid-expansion with doors left open (§9, "Ceiling and graceful closure").
-pub fn candidate_weight(
+pub(crate) fn candidate_weight(
     candidate: &Candidate,
     def: &RoomDef,
     ctx: &WeightContext,
@@ -415,7 +420,7 @@ pub fn candidate_weight(
 /// proportional to doors closed, default-on, engine-side — how many open
 /// doors a candidate closes is a property of one placement decision,
 /// unknowable in a once-per-frame table.
-pub fn multi_door_bonus(doors_closed: usize, enabled: bool) -> f32 {
+pub(crate) fn multi_door_bonus(doors_closed: usize, enabled: bool) -> f32 {
     if !enabled || doors_closed == 0 {
         return 1.0;
     }

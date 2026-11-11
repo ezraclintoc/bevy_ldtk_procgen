@@ -44,7 +44,7 @@ pub fn open_door_pos(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<
 /// definition, not the direction a candidate filling it would need. Used
 /// for `DoorAbandoned { at, dir }`.
 #[allow(clippy::missing_docs_in_private_items)]
-pub fn open_door_dir(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<Dir> {
+pub(crate) fn open_door_dir(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<Dir> {
     let placement = layout.get(d.placement)?;
     let def = catalog.get(placement.room)?;
     let door = def.doors.get(d.door as usize)?;
