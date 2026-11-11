@@ -94,6 +94,16 @@ fn main() {
 Builder options: `with_generation_radius`, `with_culling`, `with_order`, `with_placement_budget`, `with_spawn_budget`, `with_door_source`,
 `with_start`, `with_max_rooms`, `with_weight_config`.
 
+## Documentation
+
+The API guide is the crate's rustdoc front page: authoring rooms, every
+builder option, resource and message, querying the dungeon, weights, seeds and
+performance, with compiled examples.
+
+```bash
+cargo doc --no-deps --open
+```
+
 ## Examples
 
 ```bash

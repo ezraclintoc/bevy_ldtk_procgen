@@ -1,5 +1,5 @@
 //! Bevy integration layer: `GeneratorPlugin`, `GenerationSet`, and resource
-//! and event registration. See ARCHITECTURE.md §1 and §7.
+//! and event registration. The crate root's docs are the guide.
 
 use std::sync::Arc;
 
@@ -23,25 +23,25 @@ use systems::{GenRng, GenerationConfig, PlacementCountersRes};
 pub use systems::{RoomWeights, apply_weights};
 
 /// The loaded catalog, behind an `Arc` so it is cheap to share and impossible
-/// to mutate accidentally (`DESIGN.md` §1: immutable after load).
+/// to mutate accidentally.
 #[derive(Resource, Debug, Clone, Default, Deref, DerefMut)]
 pub struct CatalogRes(pub Arc<Catalog>);
 
-/// The generator's output: which rooms were placed where (`DESIGN.md` §1).
+/// The generator's output: which rooms were placed where.
 ///
 /// Append-only and never touched by culling — spawned entities are a cache
 /// over this, which is what makes revisiting an area reproduce it exactly.
 #[derive(Resource, Debug, Clone, Default, Deref, DerefMut)]
 pub struct LayoutRes(pub Layout);
 
-/// Generation follows entities carrying this (`DESIGN.md` §3).
+/// Generation follows entities carrying this.
 ///
 /// There is no camera fallback on purpose: attach it to a player, a camera, or
 /// a scripted focus point, and generation follows whichever you chose.
 #[derive(Component, Debug, Clone, Copy, Default)]
 pub struct GenerationAnchor;
 
-/// The one scheduling seam that is public API (`DESIGN.md` §9).
+/// The one scheduling seam that is public API.
 #[derive(SystemSet, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenerationSet {
     /// Where a consumer's weight-table system belongs. Adding it to this set
@@ -50,7 +50,7 @@ pub enum GenerationSet {
     Weights,
 }
 
-/// Whether and how spawned room entities are culled (DESIGN.md §8).
+/// Whether and how spawned room entities are culled.
 ///
 /// Culling only ever despawns entities — the Layout is the truth and is
 /// never touched (`AGENTS.md`, invariants), so a culled area regenerates
@@ -65,7 +65,7 @@ pub enum CullingPolicy {
     /// and despawns once it is beyond `despawn` from every anchor. Between
     /// them is a hysteresis band where a room keeps whatever state it is
     /// already in, so an anchor wobbling on a ring doesn't flicker rooms in
-    /// and out (DESIGN.md §8).
+    /// and out.
     ///
     /// The band is enforced, not trusted: `despawn` is raised to at least
     /// [`CullingPolicy::min_despawn`] if set lower (with a warning), so no
@@ -283,8 +283,8 @@ pub struct SpawnRate {
 ///
 /// Maintained by the plugin; read it, don't write it. Rebuilding is exact
 /// under [`GenerationOrder::FromOrigin`]; under
-/// [`GenerationOrder::NearestAnchor`] the anchor's route is an input too
-/// (`DESIGN.md` §7), so the same seed walked differently diverges.
+/// [`GenerationOrder::NearestAnchor`] the anchor's route is an input too,
+/// so the same seed walked differently diverges.
 #[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationSeed(pub u64);
 
@@ -355,7 +355,7 @@ impl GeneratorPlugin {
     /// so the Layout runs ahead of what is loaded, and despawned beyond
     /// 1.25×. Doors are only filled within the generation ring, which is
     /// what keeps the dungeon streaming rather than generating a whole level
-    /// up front (`DESIGN.md` §3).
+    /// up front.
     pub fn new(path: impl Into<String>, view_radius: f32) -> Self {
         Self::with_source(ProjectSource::Path(path.into()), view_radius)
     }
@@ -377,7 +377,7 @@ impl GeneratorPlugin {
     }
 
     /// For a consumer that wants to control asset loading/preloading
-    /// themselves — `DESIGN.md` §3's original `Handle<LdtkProject>` input.
+    /// themselves: pass a `Handle<LdtkProject>` already loading.
     /// `GeneratorPlugin::new` covers the common case without this.
     pub fn from_handle(handle: Handle<LdtkProject>, view_radius: f32) -> Self {
         Self::with_source(ProjectSource::Handle(handle), view_radius)
@@ -399,7 +399,7 @@ impl GeneratorPlugin {
     }
 
     /// Fix the RNG seed, making the dungeon reproducible run to run — the
-    /// highest-value debugging affordance the library has (`DESIGN.md` §3).
+    /// highest-value debugging affordance the library has.
     /// Defaults to a random seed.
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
@@ -408,14 +408,13 @@ impl GeneratorPlugin {
 
     /// Stop generating once `max` placements of the `by` kind exist — a
     /// ceiling, not a target: closure bias steers the frontier into caps as it
-    /// approaches, so the dungeon finishes instead of truncating mid-run
-    /// (`DESIGN.md` §9).
+    /// approaches, so the dungeon finishes instead of truncating mid-run.
     pub fn with_max_rooms(mut self, max: usize, by: CountBy) -> Self {
         self.max_rooms = Some((max, by));
         self
     }
 
-    /// Which room generation begins from (DESIGN.md §2, "Starting room").
+    /// Which room generation begins from.
     /// Defaults to `StartRoom::Any` — a weighted pick from the whole
     /// catalog, so a test project needs no tagging to load.
     pub fn with_start(mut self, start: StartRoom) -> Self {
@@ -444,14 +443,14 @@ impl GeneratorPlugin {
         self
     }
 
-    /// Culling policy (DESIGN.md §8). Defaults to
+    /// Culling policy. Defaults to
     /// `CullingPolicy::radius(view_radius)`.
     pub fn with_culling(mut self, culling: CullingPolicy) -> Self {
         self.culling = culling;
         self
     }
 
-    /// Meta-generation configuration (DESIGN.md §9): closure ceiling,
+    /// Meta-generation configuration: closure ceiling,
     /// per-tag quotas and depth gates, multi-door preference. Tag names
     /// resolve once against the loaded catalog. Defaults to inert — every
     /// room weighs its own `weight` float tag only.

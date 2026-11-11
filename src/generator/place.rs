@@ -18,7 +18,7 @@
 //! `generate` system, `plugin/systems.rs`):
 //! - Which door to attempt next, and the per-frame time budget (DESIGN.md
 //!   §5) — this file has no opinion on ordering across doors.
-//! - The dead-door failure counter and `DoorAbandoned` (DESIGN.md §9):
+//! - The dead-door failure counter and `DoorAbandoned`:
 //!   `attempt_door` returning `None` is "this call's full candidate pool
 //!   was exhausted", i.e. one attempt in that scheme's terms — deciding
 //!   whether to try again next frame or give up after N attempts is the
@@ -41,7 +41,7 @@ use crate::generator::geom::OpenDoorId;
 /// means every candidate weighs its own `weight` float tag alone, exactly
 /// the pre-meta behaviour. `counters` is maintained by the caller across
 /// attempts (it owns the whole loop); `table` is the consumer's once-per-
-/// frame weight table (DESIGN.md §9), short entries falling back to the
+/// frame weight table, short entries falling back to the
 /// room's base weight.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WeightParams<'a> {
@@ -199,8 +199,8 @@ fn sample_weighted<R: RngExt>(rng: &mut R, weights: &[f32]) -> Option<usize> {
 /// `weight` float tag (absent from the catalog entirely, not just from one
 /// room, means every candidate weighs `1.0` — see `catalog.rs`), sample,
 /// try to place it, and on failure remove that candidate and resample from
-/// what remains — the fix for the old `find_bridging_room` stall
-/// (`DESIGN.md`, "Resolved during design"), which tried exactly one
+/// what remains — the fix for the old `find_bridging_room` stall,
+/// which tried exactly one
 /// candidate and gave up.
 ///
 /// On success, `layout` already reflects it: the placement is committed,
@@ -434,8 +434,8 @@ fn open_door_reservation(layout: &Layout, catalog: &Catalog, open: OpenDoor) -> 
     catalog.door_reservation(pos, door.dir, door.width)
 }
 
-/// Which room generation begins from. DESIGN.md §2, "Starting room": the
-/// generator does not require a designated spawn room — requiring one would
+/// Which room generation begins from. The generator does not require a
+/// designated spawn room — requiring one would
 /// mean a five-room test project fails to load until something is tagged.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum StartRoom {

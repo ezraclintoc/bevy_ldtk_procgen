@@ -44,6 +44,7 @@ struct Observed {
     despawned: Vec<RoomId>,
     abandoned: usize,
     failed: usize,
+    settled: usize,
 }
 
 fn record_events(
@@ -52,6 +53,7 @@ fn record_events(
     mut despawned: MessageReader<RoomDespawned>,
     mut abandoned: MessageReader<DoorAbandoned>,
     mut failed: MessageReader<GenerationFailed>,
+    mut settled: MessageReader<GenerationSettled>,
     mut observed: ResMut<Observed>,
 ) {
     for event in placed.read() {
@@ -65,6 +67,7 @@ fn record_events(
     }
     observed.abandoned += abandoned.read().count();
     observed.failed += failed.read().count();
+    observed.settled += settled.read().count();
 }
 
 /// Moves the anchor so the cull side of the hysteresis band has something
@@ -175,6 +178,11 @@ fn streaming_generation_runs_end_to_end() {
     assert!(
         !observed.spawned.is_empty(),
         "placed rooms must become spawned entities"
+    );
+    assert!(
+        observed.settled >= 1,
+        "with the anchor still, generation must fill its ring and report \
+         GenerationSettled"
     );
 
     // Point → room: the anchor sits inside the start room it spawned in

@@ -61,6 +61,12 @@ jobs:
       - name: Test
         run: cargo test --release
 
+      - name: Docs (broken links fail the build)
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:

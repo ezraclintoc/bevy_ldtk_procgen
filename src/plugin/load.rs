@@ -16,7 +16,7 @@ use super::events::GenerationFailed;
 use super::systems::{GenerationConfig, PlacementCountersRes};
 use super::{ProjectSource, ProjectSourceRes};
 
-/// Where the plugin is in its own lifecycle (`DESIGN.md` §4).
+/// Where the plugin is in its own lifecycle.
 ///
 /// A Bevy state rather than a queue of flags: consumers gate their own systems
 /// on it (`run_if(in_state(GenerationState::Ready))`) instead of checking

@@ -13,8 +13,6 @@
 //!   Per-placement factors cannot live in the once-per-frame table: a frame
 //!   places several rooms and a table has no memory between them.
 
-use std::collections::HashMap;
-
 use super::catalog::{Catalog, RoomDef, TagId};
 use super::geom::RoomId;
 
@@ -27,37 +25,48 @@ pub enum CountBy {
     /// Only placements carrying this bool tag count. A hallway is a placement
     /// too, so `All` and `Tag("room")` answer very differently on a
     /// hallway-heavy catalog — which is why this is configuration and not a
-    /// constant (`DESIGN.md` §9).
+    /// constant.
     Tag(String),
 }
 
-/// **Not pinned down by DESIGN.md** — §9 names `tag_transition` and its
-/// effect but never gives this type's actual shape. First guess, not a
-/// settled decision.
-#[derive(Debug, Clone, Default)]
-pub struct TransitionTable {
-    multipliers: HashMap<(TagId, TagId), f32>,
-}
-
-impl TransitionTable {
-    pub fn set(&mut self, from: TagId, to: TagId, multiplier: f32) {
-        self.multipliers.insert((from, to), multiplier);
-    }
-
-    pub fn multiplier(&self, from: TagId, to: TagId) -> f32 {
-        self.multipliers.get(&(from, to)).copied().unwrap_or(1.0)
-    }
-}
-
-/// Meta-generation configuration, stated with tag *names* — resolved to
-/// `TagId`s once against the loaded Catalog (`WeightConfig::resolve`), never
-/// looked up by string inside the placement loop (DESIGN.md §2).
+/// Meta-generation rules for [`GeneratorPlugin::with_weight_config`]: limits
+/// and preferences the engine applies to every candidate room, on top of
+/// each room's `weight` tag and the consumer's [`RoomWeights`] table.
+///
+/// Rules name bool tags (the project's `RoomTags` enum) by string; they are
+/// resolved once when the catalog loads. A name the project doesn't declare
+/// makes its rule do nothing rather than fail the load. The dungeon-size
+/// ceiling is [`GeneratorPlugin::with_max_rooms`], not a field here.
+///
+/// ```
+/// # use bevy_ldtk_procgen::prelude::*;
+/// let rules = WeightConfig {
+///     // At most one boss room, and none before 8 rooms have been placed.
+///     tag_max: vec![("boss".into(), 1)],
+///     tag_min_depth: vec![("boss".into(), 8)],
+///     // Favour rooms that connect several open doors at once.
+///     prefer_multi_door: true,
+/// };
+/// # let _ = rules;
+/// ```
+///
+/// [`GeneratorPlugin::with_weight_config`]: crate::prelude::GeneratorPlugin::with_weight_config
+/// [`GeneratorPlugin::with_max_rooms`]: crate::prelude::GeneratorPlugin::with_max_rooms
+/// [`RoomWeights`]: crate::prelude::RoomWeights
 #[derive(Debug, Clone, Default)]
 pub struct WeightConfig {
-    pub ceiling: Option<(usize, CountBy)>,
+    /// `(tag, max)`: rooms carrying `tag` stop being candidates once `max`
+    /// of them are placed.
     pub tag_max: Vec<(String, usize)>,
+    /// `(tag, depth)`: rooms carrying `tag` are only candidates once `depth`
+    /// rooms have been placed (counted the way [`with_max_rooms`] counts, or
+    /// every room when no ceiling is set). Progress through the run, not
+    /// distance from the start room.
+    ///
+    /// [`with_max_rooms`]: crate::prelude::GeneratorPlugin::with_max_rooms
     pub tag_min_depth: Vec<(String, u32)>,
-    pub tag_transition: Option<TransitionTable>,
+    /// Weight candidates up by how many open doors they would connect at
+    /// once, which closes loops instead of leaving parallel dead ends.
     pub prefer_multi_door: bool,
 }
 
@@ -66,7 +75,7 @@ impl WeightConfig {
     /// catalog becomes available. Names matching nothing resolve to `None`
     /// and their rule is silently inert — a config naming a tag the project
     /// never declared must not fail a load (the tag set is project data).
-    pub fn resolve(&self, catalog: &Catalog) -> ResolvedWeights {
+    pub(crate) fn resolve(&self, catalog: &Catalog) -> ResolvedWeights {
         let tag_max = self
             .tag_max
             .iter()
@@ -402,7 +411,7 @@ pub fn candidate_weight(
     Some(candidate.table_weight * closure * bonus)
 }
 
-/// Multi-door preference (DESIGN.md §9, "multi-door preference"):
+/// Multi-door preference:
 /// proportional to doors closed, default-on, engine-side — how many open
 /// doors a candidate closes is a property of one placement decision,
 /// unknowable in a once-per-frame table.
