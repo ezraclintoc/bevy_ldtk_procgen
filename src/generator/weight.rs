@@ -13,8 +13,6 @@
 //!   Per-placement factors cannot live in the once-per-frame table: a frame
 //!   places several rooms and a table has no memory between them.
 
-use std::collections::HashMap;
-
 use super::catalog::{Catalog, RoomDef, TagId};
 use super::geom::RoomId;
 
@@ -27,37 +25,48 @@ pub enum CountBy {
     /// Only placements carrying this bool tag count. A hallway is a placement
     /// too, so `All` and `Tag("room")` answer very differently on a
     /// hallway-heavy catalog — which is why this is configuration and not a
-    /// constant (`DESIGN.md` §9).
+    /// constant.
     Tag(String),
 }
 
-/// **Not pinned down by DESIGN.md** — §9 names `tag_transition` and its
-/// effect but never gives this type's actual shape. First guess, not a
-/// settled decision.
-#[derive(Debug, Clone, Default)]
-pub struct TransitionTable {
-    multipliers: HashMap<(TagId, TagId), f32>,
-}
-
-impl TransitionTable {
-    pub fn set(&mut self, from: TagId, to: TagId, multiplier: f32) {
-        self.multipliers.insert((from, to), multiplier);
-    }
-
-    pub fn multiplier(&self, from: TagId, to: TagId) -> f32 {
-        self.multipliers.get(&(from, to)).copied().unwrap_or(1.0)
-    }
-}
-
-/// Meta-generation configuration, stated with tag *names* — resolved to
-/// `TagId`s once against the loaded Catalog (`WeightConfig::resolve`), never
-/// looked up by string inside the placement loop (DESIGN.md §2).
+/// Meta-generation rules for [`GeneratorPlugin::with_weight_config`]: limits
+/// and preferences the engine applies to every candidate room, on top of
+/// each room's `weight` tag and the consumer's [`RoomWeights`] table.
+///
+/// Rules name bool tags (the project's `RoomTags` enum) by string; they are
+/// resolved once when the catalog loads. A name the project doesn't declare
+/// makes its rule do nothing rather than fail the load. The dungeon-size
+/// ceiling is [`GeneratorPlugin::with_max_rooms`], not a field here.
+///
+/// ```
+/// # use bevy_ldtk_procgen::prelude::*;
+/// let rules = WeightConfig {
+///     // At most one boss room, and none before 8 rooms have been placed.
+///     tag_max: vec![("boss".into(), 1)],
+///     tag_min_depth: vec![("boss".into(), 8)],
+///     // Favour rooms that connect several open doors at once.
+///     prefer_multi_door: true,
+/// };
+/// # let _ = rules;
+/// ```
+///
+/// [`GeneratorPlugin::with_weight_config`]: crate::prelude::GeneratorPlugin::with_weight_config
+/// [`GeneratorPlugin::with_max_rooms`]: crate::prelude::GeneratorPlugin::with_max_rooms
+/// [`RoomWeights`]: crate::prelude::RoomWeights
 #[derive(Debug, Clone, Default)]
 pub struct WeightConfig {
-    pub ceiling: Option<(usize, CountBy)>,
+    /// `(tag, max)`: rooms carrying `tag` stop being candidates once `max`
+    /// of them are placed.
     pub tag_max: Vec<(String, usize)>,
+    /// `(tag, depth)`: rooms carrying `tag` are only candidates once `depth`
+    /// rooms have been placed (counted the way [`with_max_rooms`] counts, or
+    /// every room when no ceiling is set). Progress through the run, not
+    /// distance from the start room.
+    ///
+    /// [`with_max_rooms`]: crate::prelude::GeneratorPlugin::with_max_rooms
     pub tag_min_depth: Vec<(String, u32)>,
-    pub tag_transition: Option<TransitionTable>,
+    /// Weight candidates up by how many open doors they would connect at
+    /// once, which closes loops instead of leaving parallel dead ends.
     pub prefer_multi_door: bool,
 }
 
@@ -66,7 +75,7 @@ impl WeightConfig {
     /// catalog becomes available. Names matching nothing resolve to `None`
     /// and their rule is silently inert — a config naming a tag the project
     /// never declared must not fail a load (the tag set is project data).
-    pub fn resolve(&self, catalog: &Catalog) -> ResolvedWeights {
+    pub(crate) fn resolve(&self, catalog: &Catalog) -> ResolvedWeights {
         let tag_max = self
             .tag_max
             .iter()
@@ -88,7 +97,7 @@ impl WeightConfig {
 /// `WeightConfig` with every name resolved — what the placement loop reads.
 /// Built once at catalog load; immutable afterwards.
 #[derive(Debug, Clone, Default)]
-pub struct ResolvedWeights {
+pub(crate) struct ResolvedWeights {
     pub tag_max: Vec<(TagId, usize)>,
     pub tag_min_depth: Vec<(TagId, u32)>,
     pub prefer_multi_door: bool,
@@ -98,7 +107,7 @@ pub struct ResolvedWeights {
 /// built-ins and (as a snapshot, if ever needed) by consumers.
 /// Field semantics per DESIGN.md §9.
 #[derive(Debug, Clone, Default)]
-pub struct PlacementCounters {
+pub(crate) struct PlacementCounters {
     pub placed_total: usize,
     /// One slot per `TagId` — not a `HashMap` — the entire reason bool tags
     /// are interned.
@@ -113,7 +122,7 @@ pub struct PlacementCounters {
 
 impl PlacementCounters {
     /// Sized to the catalog's `TagId` space — the whole point of interning.
-    pub fn new(catalog: &Catalog) -> Self {
+    pub(crate) fn new(catalog: &Catalog) -> Self {
         Self {
             tag_counts: vec![0; catalog.tag_count()],
             rooms_since_tag: vec![0; catalog.tag_count()],
@@ -129,7 +138,12 @@ impl PlacementCounters {
     ///
     /// This is a hot-path-friendly bulk op: three field updates per tag.
     #[allow(clippy::too_many_arguments)]
-    pub fn record(&mut self, tag_count: usize, carried: impl Fn(usize) -> bool, progresses: bool) {
+    pub(crate) fn record(
+        &mut self,
+        tag_count: usize,
+        carried: impl Fn(usize) -> bool,
+        progresses: bool,
+    ) {
         self.placed_total += 1;
         if progresses {
             self.progress += 1;
@@ -150,7 +164,7 @@ impl PlacementCounters {
 /// how many currently-open doors placing it would close (the multi-door
 /// bonus's input).
 #[derive(Debug, Clone, Copy)]
-pub struct Candidate {
+pub(crate) struct Candidate {
     /// Kept on the candidate so future adjustments (e.g. anti-repeat via
     /// `recent_templates`) can key on it without changing every call site.
     #[allow(dead_code)]
@@ -161,7 +175,7 @@ pub struct Candidate {
 
 /// Everything the per-placement weight adjustment needs.
 #[derive(Debug, Clone, Copy)]
-pub struct WeightContext<'a> {
+pub(crate) struct WeightContext<'a> {
     pub resolved: &'a ResolvedWeights,
     pub counters: &'a PlacementCounters,
 }
@@ -354,7 +368,7 @@ mod tests {
 /// Single-door caps keep full weight while high-door rooms collapse — the
 /// frontier shrinks as the ceiling approaches instead of being cut off
 /// mid-expansion with doors left open (§9, "Ceiling and graceful closure").
-pub fn candidate_weight(
+pub(crate) fn candidate_weight(
     candidate: &Candidate,
     def: &RoomDef,
     ctx: &WeightContext,
@@ -402,11 +416,11 @@ pub fn candidate_weight(
     Some(candidate.table_weight * closure * bonus)
 }
 
-/// Multi-door preference (DESIGN.md §9, "multi-door preference"):
+/// Multi-door preference:
 /// proportional to doors closed, default-on, engine-side — how many open
 /// doors a candidate closes is a property of one placement decision,
 /// unknowable in a once-per-frame table.
-pub fn multi_door_bonus(doors_closed: usize, enabled: bool) -> f32 {
+pub(crate) fn multi_door_bonus(doors_closed: usize, enabled: bool) -> f32 {
     if !enabled || doors_closed == 0 {
         return 1.0;
     }

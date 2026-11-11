@@ -4,7 +4,7 @@
 //! against open doors and checking overlap is `place.rs`'s job; this file
 //! only keeps `placements`, `open_doors`, and the two spatial indices (rooms
 //! and open doors) from drifting out of sync with each other, the way the
-//! old `WorldState::add_room` did for its two structures (ARCHITECTURE.md §5).
+//! old `WorldState::add_room` did for its two structures.
 
 use std::collections::HashMap;
 
@@ -44,7 +44,7 @@ pub fn open_door_pos(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<
 /// definition, not the direction a candidate filling it would need. Used
 /// for `DoorAbandoned { at, dir }`.
 #[allow(clippy::missing_docs_in_private_items)]
-pub fn open_door_dir(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<Dir> {
+pub(crate) fn open_door_dir(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<Dir> {
     let placement = layout.get(d.placement)?;
     let def = catalog.get(placement.room)?;
     let door = def.doors.get(d.door as usize)?;
@@ -52,7 +52,7 @@ pub fn open_door_dir(layout: &Layout, catalog: &Catalog, d: OpenDoor) -> Option<
 }
 
 /// Which rooms were placed where: the generator's output and the only truth
-/// about the dungeon (`DESIGN.md` §1).
+/// about the dungeon.
 ///
 /// Append-only. Spawned entities are a cache over this, and culling is not
 /// allowed to touch it — otherwise doors reopen, revisited areas regenerate
@@ -69,7 +69,7 @@ pub struct Layout {
     /// own tile plus its reservation. Kept so `close_door` can unindex it.
     door_rects: Vec<TileRect>,
     /// Open door -> its id. Point lookups only, never iterated, so it can't
-    /// leak `HashMap` order into placement (`DESIGN.md` §7).
+    /// leak `HashMap` order into placement.
     door_ids: HashMap<OpenDoor, OpenDoorId>,
     /// Open doors by `door_rects`. Every query placement makes about doors —
     /// which ones a candidate connects to, which reservations it touches,
@@ -170,7 +170,7 @@ impl Layout {
             .unwrap_or_default()
     }
 
-    /// Point -> room lookup (DESIGN.md §4, "needed constantly"), via the
+    /// Point -> room lookup, via the
     /// spatial index rather than a full scan.
     pub fn room_at(&self, catalog: &Catalog, pos: TilePos) -> Option<RoomId> {
         let point = TileRect {

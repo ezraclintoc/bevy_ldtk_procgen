@@ -44,7 +44,7 @@ pub struct RoomSpawned {
 
 /// A room's entities were removed, by culling or by a [`Regenerate`].
 ///
-/// The Layout is unchanged by culling (`DESIGN.md` §8), so a room reported
+/// The Layout is unchanged by culling, so a room reported
 /// here can come back with [`RoomSpawned`]; only `Regenerate` makes a
 /// placement disappear for good.
 #[derive(Message, Debug, Clone, Copy)]
@@ -63,7 +63,7 @@ pub struct GenerationFailed(pub CatalogErrors);
 
 /// A door was given up on: it is no longer open, and nothing will ever be
 /// placed through it. It is now a permanent gap in the dungeon, for the
-/// consumer to wall off however its art allows (`DESIGN.md` §9).
+/// consumer to wall off however its art allows.
 #[derive(Message, Debug, Clone, Copy)]
 pub struct DoorAbandoned {
     /// The door footprint's min corner, in tiles.
@@ -84,8 +84,7 @@ pub struct GenerationSettled;
 /// invariants), so a demo's `R` handler is the consumer's own system writing
 /// this. `seed: None` re-rolls from entropy; `seed: Some(s)` reproduces
 /// exactly what `s` builds, which is what lets a player press R until the
-/// dungeon looks good and then hard-code the seed that produced it
-/// (`DESIGN.md` §3).
+/// dungeon looks good and then hard-code the seed that produced it.
 #[derive(Message, Debug, Clone, Copy, Default)]
 pub struct Regenerate {
     /// `None` re-rolls from entropy; `Some(seed)` rebuilds exactly what that

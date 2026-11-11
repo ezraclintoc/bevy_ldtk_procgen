@@ -10,7 +10,7 @@ non-linear layout at runtime — no hand-authored dungeon required.
 > [!WARNING]
 > **Pre-alpha.** Public API changes without notice.
 
-![The testing example: a corridor maze streaming around the camera, then a deterministic dungeon growing as a disc from the origin](media/demo.gif)
+![The testing example: a corridor maze streaming around the camera, then a deterministic dungeon growing as a disc from the origin](https://raw.githubusercontent.com/ezraclintoc/bevy_ldtk_procgen/main/media/demo.gif)
 
 *`cargo run --release --example testing`, halls mode, seed 102. First half: the
 default order, filling doors nearest the camera. Second half: deterministic
@@ -22,7 +22,7 @@ FPS is capped by the recording monitor's 60 Hz vsync.*
 
 | `bevy_ldtk_procgen` | `bevy` | `bevy_ecs_ldtk` |
 | ------------------- | ------ | --------------- |
-| unreleased          | `0.18` | `0.14`          |
+| unreleased          | `0.20` | `0.16`          |
 
 ## Features
 
@@ -94,6 +94,16 @@ fn main() {
 Builder options: `with_generation_radius`, `with_culling`, `with_order`, `with_placement_budget`, `with_spawn_budget`, `with_door_source`,
 `with_start`, `with_max_rooms`, `with_weight_config`.
 
+## Documentation
+
+The API guide is the crate's rustdoc front page: authoring rooms, every
+builder option, resource and message, querying the dungeon, weights, seeds and
+performance, with compiled examples.
+
+```bash
+cargo doc --no-deps --open
+```
+
 ## Examples
 
 ```bash
@@ -116,7 +126,7 @@ Release build, bundled 16px catalog:
 
 | | |
 |---|---|
-| Placing a room (layout data only) | ~9.5 µs, flat from 10k to 100k rooms |
+| Placing a room (layout data only) | ~10 µs, flat from 1k to 10M rooms (~29 bytes each) |
 | Spawning a room (`bevy_ecs_ldtk` tilemaps) | ~2.6 µs per tile (~0.1 ms for a typical room) |
 | Loading ~300 rooms after a teleport | 0.07-0.12 s, no frame over 20 ms (60 Hz) |
 | Generator share of a frame while streaming | under 0.2 ms of 7 ms |

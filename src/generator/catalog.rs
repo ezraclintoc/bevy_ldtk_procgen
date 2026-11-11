@@ -10,7 +10,7 @@
 //! `Vec<_>` — no Bevy math or asset types — so nothing here leaks into the
 //! zero-glam types (`TilePos`, `TileSize`) the rest of `generator/` uses.
 //!
-//! This function embodies "Strict" validation (DESIGN.md §6): any problem
+//! This function embodies "Strict" validation: any problem
 //! found means `Err`. A "Lenient" wrapper that drops offending rooms and
 //! proceeds is a separate, not-yet-written layer on top of this one.
 //! `NoStartRoomMatched` is not checked here — it depends on `StartRoom`
@@ -26,8 +26,8 @@ use super::error::CatalogErrors;
 use super::geom::{Dir, PixelPos, RoomId, TilePos, TileRect, TileSize};
 
 /// Everything that can make a catalog fail to build, or generation to fail to
-/// start. This enum is the replacement for the old implementation's panics
-/// (`DESIGN.md` §6): every case that *has* a name in the project names it,
+/// start. This enum is the replacement for the old implementation's panics:
+/// every case that *has* a name in the project names it,
 /// because "invalid room" without a name is not actionable.
 ///
 /// `#[non_exhaustive]`: a consumer matching on this gets a compile error when
@@ -40,7 +40,7 @@ pub enum CatalogError {
     /// the authoring contract does not cover yet).
     EmptyCatalog,
     /// `StartRoom` asked for a constraint nothing satisfies. Conditional by
-    /// design (`DESIGN.md` §2): silence unless a constraint was requested.
+    /// design: silence unless a constraint was requested.
     NoStartRoomMatched {
         /// The constraint as it was asked for, so the message says *what*
         /// had no match rather than just that something didn't.
@@ -78,7 +78,7 @@ pub enum CatalogError {
         at: TilePos,
     },
     /// A `Door` entity touches no level edge. Direction comes from the edge
-    /// it sits on (`DESIGN.md` §2), so a door that touches none cannot be
+    /// it sits on, so a door that touches none cannot be
     /// oriented — and inferring it from the entity's size is exactly the old
     /// `entity.width != 16` bug (`AGENTS.md`, invariants).
     DoorNotOnEdge {
@@ -113,8 +113,7 @@ pub enum CatalogError {
     /// load (missing file, I/O error), before there was any JSON to
     /// validate. Folded into this enum anyway rather than inventing a
     /// second failure type: `GenerationFailed(CatalogErrors)` is the one
-    /// failure surface DESIGN.md §4 defines, and this still needs to reach
-    /// it.
+    /// failure surface, and this still needs to reach it.
     AssetLoadFailed {
         /// The asset system's own error, verbatim — it knows more about why
         /// the load failed than this crate can.
@@ -155,7 +154,7 @@ pub struct TagId(pub(crate) u16);
 
 /// Interned float tag id — an index into each room's float tag vector, minted
 /// only by the catalog. Like `TagId`, never a name: names are resolved once at
-/// catalog build (`DESIGN.md` §2).
+/// catalog build.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FloatTagId(pub(crate) u16);
 
@@ -164,8 +163,7 @@ pub struct FloatTagId(pub(crate) u16);
 pub struct RoomDef {
     /// LDtk's instance id for the level — what an instance handle needs.
     pub iid: String,
-    /// The level's LDtk identifier — what `StartRoom::Named` matches on
-    /// (DESIGN.md §2, "Starting room").
+    /// The level's LDtk identifier — what `StartRoom::Named` matches on.
     pub identifier: String,
     /// The level's size in TILES — the placement footprint.
     pub size: TileSize,
@@ -186,7 +184,7 @@ impl RoomDef {
 
     /// A float tag's value; `0.0` when absent — the one deliberate exception
     /// is a room's base selection weight, which defaults to `1.0` at the
-    /// sampling site, not here (`DESIGN.md` §2).
+    /// sampling site, not here.
     pub fn float_tag(&self, id: FloatTagId) -> f32 {
         self.float_tags.get(id.0 as usize).copied().unwrap_or(0.0)
     }
@@ -222,7 +220,7 @@ impl RoomDef {
 }
 
 /// Every room definition parsed from the project, plus the derived indices
-/// placement reads (`DESIGN.md` §1). Immutable after load: nothing here is
+/// placement reads. Immutable after load: nothing here is
 /// ever mutated during generation, which is what makes a seed reproduce the
 /// same dungeon regardless of what was visited or culled.
 #[derive(Debug, Clone, Default)]
@@ -232,7 +230,7 @@ pub struct Catalog {
     float_tag_ids: HashMap<String, FloatTagId>,
     grid_size: u32,
     /// Largest room dimension in the catalog — the spatial hash's default
-    /// cell size (ARCHITECTURE.md §5), computed once here rather than
+    /// cell size, computed once here rather than
     /// re-scanned by every caller that needs it.
     spatial_cell_size: u32,
     /// Per open-door `(direction, width)`: the footprint of the room reserved
@@ -271,7 +269,7 @@ impl Catalog {
     }
 
     /// Resolve a bool tag name — setup-time only, never inside the placement
-    /// loop (`DESIGN.md` §2). `None` means the project never declared it.
+    /// loop. `None` means the project never declared it.
     pub fn tag_id(&self, name: &str) -> Option<TagId> {
         self.bool_tag_ids.get(name).copied()
     }
@@ -281,8 +279,8 @@ impl Catalog {
         self.float_tag_ids.get(name).copied()
     }
 
-    /// The space kept free beyond one open door so it can always be filled
-    /// (`ARCHITECTURE.md` §6): the full footprint the door's *reserved room*
+    /// The space kept free beyond one open door so it can always be filled:
+    /// the full footprint the door's *reserved room*
     /// would occupy if placed through it. The reserved room is the smallest
     /// cap (single-door room) that connects through a `(dir, width)` door,
     /// or — when no such cap exists — the smallest room of any door count
@@ -334,8 +332,7 @@ impl Catalog {
     }
 
     /// Pixels per tile, read once from the project — the only tile-size value
-    /// in the crate, and the reason nothing has to assume 16 (`ARCHITECTURE.md`
-    /// §2).
+    /// in the crate, and the reason nothing has to assume 16.
     pub fn grid_size(&self) -> u32 {
         self.grid_size
     }
@@ -348,7 +345,7 @@ impl Catalog {
     }
 
     /// Bounds any room's rect to at most four spatial-hash cells regardless
-    /// of grid size. See ARCHITECTURE.md §5.
+    /// of grid size: the largest room dimension, in tiles.
     pub fn spatial_cell_size(&self) -> u32 {
         self.spatial_cell_size
     }
@@ -367,7 +364,7 @@ impl Catalog {
     }
 
     /// Rooms in `RoomId` order — entry `i` is `RoomId(i)`, which is exactly the
-    /// order a consumer weight table is indexed by (`DESIGN.md` §9).
+    /// order a consumer weight table is indexed by.
     pub fn iter(&self) -> impl Iterator<Item = &RoomDef> {
         self.rooms.iter()
     }
@@ -783,7 +780,7 @@ fn collect_gap_doors(
 }
 
 /// Direction comes from which level edge the door touches — never a
-/// hardcoded tile width (DESIGN.md §2, "Why doors are entities").
+/// hardcoded tile width.
 fn build_door(
     entity: &EntityInstance,
     level: &Level,
@@ -897,7 +894,7 @@ fn resolve_float_tags(level: &Level, names: &[String]) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    /// The bundled catalog predates the tags redesign (DESIGN.md §2): it has
+    /// The bundled catalog predates the tags redesign: it has
     /// no `RoomTags` enum and no `Float` fields, so every room parses with
     /// zero tags here — correct per the new schema, but this fixture cannot
     /// exercise tag resolution. It can exercise door/room/grid-size parsing.

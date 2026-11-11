@@ -44,6 +44,7 @@ struct Observed {
     despawned: Vec<RoomId>,
     abandoned: usize,
     failed: usize,
+    settled: usize,
 }
 
 fn record_events(
@@ -52,6 +53,7 @@ fn record_events(
     mut despawned: MessageReader<RoomDespawned>,
     mut abandoned: MessageReader<DoorAbandoned>,
     mut failed: MessageReader<GenerationFailed>,
+    mut settled: MessageReader<GenerationSettled>,
     mut observed: ResMut<Observed>,
 ) {
     for event in placed.read() {
@@ -65,6 +67,7 @@ fn record_events(
     }
     observed.abandoned += abandoned.read().count();
     observed.failed += failed.read().count();
+    observed.settled += settled.read().count();
 }
 
 /// Moves the anchor so the cull side of the hysteresis band has something
@@ -105,6 +108,9 @@ fn headless_app(plugin: GeneratorPlugin) -> App {
     // `ImagePlugin` inits `Image` but not the atlas layout type that
     // `bevy_ecs_ldtk`'s level spawn path writes to.
     app.init_asset::<TextureAtlasLayout>();
+    // bevy_ecs_tilemap 0.20 loads its shader at plugin build, and with no
+    // render plugins nothing else registers the asset type.
+    app.init_asset::<bevy::shader::Shader>();
     app.insert_resource(ClearColor::default())
         .add_plugins(LdtkPlugin)
         .add_plugins(plugin);
@@ -175,6 +181,11 @@ fn streaming_generation_runs_end_to_end() {
     assert!(
         !observed.spawned.is_empty(),
         "placed rooms must become spawned entities"
+    );
+    assert!(
+        observed.settled >= 1,
+        "with the anchor still, generation must fill its ring and report \
+         GenerationSettled"
     );
 
     // Point → room: the anchor sits inside the start room it spawned in

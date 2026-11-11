@@ -12,7 +12,7 @@ of them about intended behaviour, they win and this file is the thing to fix.
 
 ## What this is
 
-`bevy_ldtk_procgen` is a **library crate** (Bevy 0.18 / `bevy_ecs_ldtk` 0.14) that
+`bevy_ldtk_procgen` is a **library crate** (Bevy 0.20 / `bevy_ecs_ldtk` 0.16) that
 procedurally connects LDtk levels into a dungeon at runtime. There are no `[[bin]]`
 targets.
 

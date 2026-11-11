@@ -29,7 +29,7 @@ pub struct OpenDoorId {
 
 /// A tile coordinate in `generator/`'s y-up frame. Integer everywhere on
 /// purpose: two integer adds replace the old float comparisons, so no epsilon
-/// and no `float_cmp` (`ARCHITECTURE.md` §3).
+/// and no `float_cmp`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct TilePos {
     /// Column, increasing to the right.
@@ -61,7 +61,7 @@ impl std::ops::Sub for TilePos {
 }
 
 /// A size in TILES — a room's footprint, or a door reservation.
-/// Pixels only enter the picture at the plugin boundary (`ARCHITECTURE.md` §2).
+/// Pixels only enter the picture at the plugin boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileSize {
     /// Extent along x, in tiles.
@@ -108,8 +108,8 @@ impl TileRect {
     }
 
     /// Distance from `pos` to the nearest point of this rect, in tiles —
-    /// `0.0` when inside. The measure spawn/cull radii are checked against
-    /// (DESIGN.md §8): a room is "near" an anchor by its closest corner,
+    /// `0.0` when inside. The measure spawn/cull radii are checked against:
+    /// a room is "near" an anchor by its closest corner,
     /// not its center.
     pub fn distance_to(self, pos: TilePos) -> f32 {
         let max = self.max();

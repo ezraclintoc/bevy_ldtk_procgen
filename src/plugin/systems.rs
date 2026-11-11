@@ -18,7 +18,8 @@ use crate::generator::place::{StartRoom, WeightParams, attempt_door, place_start
 use crate::generator::weight::{CountBy, PlacementCounters, ResolvedWeights, WeightContext};
 
 use super::events::{
-    DoorAbandoned, GenerationFailed, Regenerate, RoomDespawned, RoomPlaced, RoomSpawned,
+    DoorAbandoned, GenerationFailed, GenerationSettled, Regenerate, RoomDespawned, RoomPlaced,
+    RoomSpawned,
 };
 use super::load::{GenerationState, LdtkHandle};
 use super::{
@@ -26,7 +27,7 @@ use super::{
     OriginReach, PlacementBudget, SpawnBudget, SpawnRate, StreamingRadii,
 };
 
-/// The consumer's once-per-frame weight table (DESIGN.md §9). Written by a
+/// The consumer's once-per-frame weight table. Written by a
 /// consumer system piped into the public [`apply_weights`] — never mutated
 /// by the engine — and read by `generate` when weighting candidates.
 ///
@@ -36,11 +37,11 @@ use super::{
 /// rather than an error). `None` (the default) means no consumer table —
 /// every candidate weighs its base weight only.
 ///
-/// [`apply_weights`]: crate::apply_weights
-#[derive(Resource, Default, Deref, DerefMut)]
+/// [`apply_weights`]: crate::prelude::apply_weights
+#[derive(Resource, Debug, Default, Deref, DerefMut)]
 pub struct RoomWeights(pub Option<Vec<f32>>);
 
-/// The pipe target consumers attach their weight system to (DESIGN.md §9):
+/// The pipe target consumers attach their weight system to:
 ///
 /// ```ignore
 /// app.add_systems(Update, my_weights.pipe(apply_weights).in_set(GenerationSet::Weights));
@@ -116,14 +117,12 @@ pub(crate) fn resolve_seed(seed: Option<u64>) -> u64 {
 /// `GeneratorPlugin`'s own fields — previously discarded entirely in
 /// `Plugin::build` (`let _ = (self.generation_radius, ...)`). `weights`
 /// starts unresolved (empty) and is filled in by `poll_ldtk_load` once the
-/// catalog exists — tag names resolve against the loaded catalog, once
-/// (DESIGN.md §2).
+/// catalog exists — tag names resolve against the loaded catalog, once.
 /// `generation_radius`, `max_rooms`, and `start`, plumbed from
 /// `GeneratorPlugin`'s own fields — previously discarded entirely in
 /// `Plugin::build` (`let _ = (self.generation_radius, ...)`). `weights`
 /// starts unresolved (empty) and is filled in by `poll_ldtk_load` once the
-/// catalog exists — tag names resolve against the loaded catalog, once
-/// (DESIGN.md §2).
+/// catalog exists — tag names resolve against the loaded catalog, once.
 #[derive(Resource, Clone)]
 pub(crate) struct GenerationConfig {
     pub door_source: DoorSource,
@@ -135,7 +134,7 @@ pub(crate) struct GenerationConfig {
     pub resolved: Option<ResolvedWeights>,
 }
 
-/// Engine-maintained placement counters (DESIGN.md §9) — the per-placement
+/// Engine-maintained placement counters — the per-placement
 /// memory a once-per-frame weight table lacks. Updated by `generate` on
 /// every commit, read by `candidate_weight` through `WeightContext`.
 #[derive(Resource, Default, Deref, DerefMut)]
@@ -159,7 +158,7 @@ pub(crate) struct Announced;
 
 /// Translation for a room's world entity such that the level content's min
 /// corner lands on `origin` in Bevy's y-up pixel space — tiles → px and the
-/// one y-flip, both at this boundary (ARCHITECTURE.md §2).
+/// one y-flip, both at this boundary.
 pub(crate) fn room_translation(origin: TilePos, def: &RoomDef, grid_size: f32) -> Vec2 {
     let px_hei = def.size.height as f32 * grid_size;
     let target = Vec2::new(origin.x as f32 * grid_size, origin.y as f32 * grid_size);
@@ -172,7 +171,7 @@ pub(crate) fn room_translation(origin: TilePos, def: &RoomDef, grid_size: f32) -
 }
 
 /// Distance in tiles from the nearest anchor to `rect` — `INFINITY` with no
-/// anchors (DESIGN.md §3: zero anchors -> idle).
+/// anchors.
 fn nearest_anchor_distance(rect: TileRect, anchors: &[TilePos]) -> f32 {
     anchors
         .iter()
@@ -194,7 +193,7 @@ fn should_spawn(
 }
 
 /// Policy gate for despawning a room entity. Never with zero anchors — a
-/// missing anchor is the normal state during loading (DESIGN.md §3), not a
+/// missing anchor is the normal state during loading, not a
 /// reason to cull the world.
 fn should_cull(
     culling: CullingPolicy,
@@ -230,8 +229,8 @@ pub(crate) fn enforce_ldtk_settings(world: &mut World) {
 }
 
 /// Anchor positions in y-up tile coordinates, position-sorted — never
-/// entity order: entity IDs depend on spawn order and are reused
-/// (DESIGN.md §3, "multiple anchors"). The distances both systems compute
+/// entity order: entity IDs depend on spawn order and are reused.
+/// The distances both systems compute
 /// from this are commutative over the set and don't need the order; the
 /// start-room bootstrap picks *one* anchor and does.
 fn anchor_tiles(
@@ -346,14 +345,14 @@ fn abandon_door(
     abandoned_events.write(DoorAbandoned { at, dir });
 }
 
-/// The synchronous placement driver (ARCHITECTURE.md §7): runs
+/// The synchronous placement driver: runs
 /// `place::attempt_door` over open doors within `generation_radius`,
 /// nearest-to-anchor first, up to `ROOMS_PER_FRAME` placements. No
 /// `Commands`, no entity queries — `sync_entities` is where spawning
 /// happens, kept separate so this stays trivially testable.
 ///
 /// Candidates are weighted by the consumer's `RoomWeights` table combined
-/// with the engine-side per-placement adjustments (`DESIGN.md` §9); with no
+/// with the engine-side per-placement adjustments; with no
 /// table set, each weighs its own `weight` float tag alone.
 pub(crate) fn generate(
     catalog: Res<CatalogRes>,
@@ -368,13 +367,27 @@ pub(crate) fn generate(
     mut reach: ResMut<OriginReach>,
     mut frontier: ResMut<OriginFrontierRes>,
     anchors: Query<&GlobalTransform, With<GenerationAnchor>>,
-    mut placed_events: MessageWriter<RoomPlaced>,
-    mut abandoned_events: MessageWriter<DoorAbandoned>,
-    mut failed_events: MessageWriter<GenerationFailed>,
+    // One tuple: Bevy systems take at most 16 parameters.
+    (mut placed_events, mut abandoned_events, mut failed_events, mut settled_events): (
+        MessageWriter<RoomPlaced>,
+        MessageWriter<DoorAbandoned>,
+        MessageWriter<GenerationFailed>,
+        MessageWriter<GenerationSettled>,
+    ),
+    mut was_settled: Local<bool>,
     mut next_state: ResMut<NextState<GenerationState>>,
 ) {
+    // `GenerationSettled` fires once per transition from working to idle,
+    // not on every idle frame.
+    let mut settle = |now_settled: bool| {
+        if now_settled && !*was_settled {
+            settled_events.write(GenerationSettled);
+        }
+        *was_settled = now_settled;
+    };
     if let Some((max, by)) = &config.max_rooms {
         if room_count(&catalog, &layout, by) >= *max {
+            settle(true);
             return;
         }
     }
@@ -387,10 +400,14 @@ pub(crate) fn generate(
     // DESIGN.md §3: zero anchors -> idle, not an error.
     let anchors = anchor_tiles(&anchors, grid_size);
     if anchors.is_empty() {
+        settle(true);
         return;
     }
 
     let mut placed_this_frame = 0;
+    // Whether the loop below stopped because nothing was left to do, as
+    // opposed to running out of budget.
+    let mut out_of_work = false;
 
     // Bootstrap: the first placement, centered on the first anchor — or on
     // the origin under `FromOrigin`, so where the anchor happened to stand
@@ -483,12 +500,17 @@ pub(crate) fn generate(
                     || started.elapsed() >= budget.from_origin_time
             }
         };
-        if over_budget || ceiling.is_some_and(|max| counters.progress >= max) {
+        if ceiling.is_some_and(|max| counters.progress >= max) {
+            out_of_work = true;
+            break;
+        }
+        if over_budget {
             break;
         }
         let door_id = match *order {
             GenerationOrder::NearestAnchor => {
                 let Some(door_id) = snapshot.next() else {
+                    out_of_work = true;
                     break;
                 };
                 // An earlier iteration this same frame may already have
@@ -500,6 +522,7 @@ pub(crate) fn generate(
             }
             GenerationOrder::FromOrigin => {
                 let Some(door_id) = frontier.0.next(&layout, &catalog, reach_tiles) else {
+                    out_of_work = true;
                     break;
                 };
                 door_id
@@ -555,6 +578,9 @@ pub(crate) fn generate(
             }
         }
     }
+    // A frame that placed rooms may have opened new doors within reach, so
+    // only a frame that placed nothing and ran out of work is settled.
+    settle(out_of_work && placed_this_frame == 0);
 }
 
 /// The ceiling in `PlacementCounters::progress`'s counting convention:
@@ -574,12 +600,14 @@ fn progress_ceiling(max: &Option<(usize, CountBy)>, catalog: &Catalog) -> Option
     }
 }
 
-/// Whether one committed placement counts toward the ceiling: `All` always,
-/// `Tag` only when the room carries the tag. A name the catalog doesn't
-/// define can never match — nothing carries a tag the project never declared.
+/// Whether one committed placement counts toward progress (the ceiling and
+/// `tag_min_depth`): `All` always, `Tag` only when the room carries the tag.
+/// A name the catalog doesn't define can never match — nothing carries a tag
+/// the project never declared. With no ceiling every room counts, so depth
+/// gates still open in an endless dungeon.
 fn progresses(max: &Option<(usize, CountBy)>, catalog: &Catalog, def: &RoomDef) -> bool {
     match max {
-        None => false,
+        None => true,
         Some((_, CountBy::All)) => true,
         Some((_, CountBy::Tag(name))) => catalog.tag_id(name).is_some_and(|id| def.bool_tag(id)),
     }
@@ -589,8 +617,8 @@ fn progresses(max: &Option<(usize, CountBy)>, catalog: &Catalog, def: &RoomDef) 
 /// room, reseed, and let `generate` rebuild around the anchor's current
 /// position.
 ///
-/// The Layout is truth and spawned entities are a cache over it
-/// (DESIGN.md §1), so regenerating means throwing the truth away — and every
+/// The Layout is truth and spawned entities are a cache over it,
+/// so regenerating means throwing the truth away — and every
 /// derived structure with it: the open-door set (inside `Layout`), the
 /// per-door failure counts, and the placement counters. The counters are the
 /// subtle one: they are per *catalog*, so keeping them would let the second
@@ -650,9 +678,9 @@ pub(crate) fn apply_regeneration(
 /// Layout — ARCHITECTURE.md §7. All `Commands` and entity access live here;
 /// `generate` deliberately has none.
 ///
-/// Spawned entities are a cache over the Layout (DESIGN.md §1): this system
+/// Spawned entities are a cache over the Layout: this system
 /// never touches `LayoutRes`, so culling can't reopen doors or break seed
-/// reproduction (DESIGN.md §8).
+/// reproduction.
 #[allow(clippy::too_many_arguments)] // a Bevy system's parameters are its inputs
 pub(crate) fn sync_entities(
     mut commands: Commands,
@@ -1379,5 +1407,20 @@ mod tests {
             last > 1000,
             "budget stuck at {last} after the display change"
         );
+    }
+
+    /// Without a room ceiling every placement must still count as progress,
+    /// or a `tag_min_depth` gate could never open in an endless dungeon.
+    #[test]
+    fn every_room_progresses_without_a_ceiling() {
+        let catalog = load_catalog();
+        let def = catalog.iter().next().unwrap();
+        assert!(progresses(&None, &catalog, def));
+        assert!(progresses(&Some((10, CountBy::All)), &catalog, def));
+        assert!(!progresses(
+            &Some((10, CountBy::Tag("no_such_tag".into()))),
+            &catalog,
+            def
+        ));
     }
 }
