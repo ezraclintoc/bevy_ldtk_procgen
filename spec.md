@@ -1,159 +1,183 @@
 # bevy_ldtk_procgen - Spec & Benchmarks
 
 Human-readable spec of the generation algorithm, plus a running performance log.
-Updated by `/prep-commit` right before a commit, so each commit's version of this file
-is a snapshot - the point is to be able to compare a future version (e.g. once spatial
-hashing replaces the current flat linear collision scan) against today's numbers using
-plain git history, not a separate benchmark tool.
+Each commit's version of this file is a snapshot, so a future version can be compared
+against today's numbers with plain git history rather than a separate benchmark tool.
 
 ## Architecture
 
-Rooms are authored in LDtk (`assets/rooms.ldtk`), one level per room, each carrying
-`Door` entities on its edges plus `weight` (float) and `room_type`
-(`Spawn`/`Room`/`Hallway`) level fields.
+Rooms are authored in LDtk, one level per room. Each level carries `Door` entities flush
+against its edges, plus optional tags: bool tags from the project-wide `RoomTags` enum,
+and float fields (`weight` is the room's base selection weight).
 
-Startup gates through `GenerationState`: `AssetLoading -> Indexing -> Ready`. Once the
-LDtk asset is loaded, every level is parsed into a `RoomIndex` (a flat `Vec<RoomDef>`
-catalog plus a `HashMap<Dir, Vec<usize>>` index keyed by which direction each room has a
-door facing). Generation then runs in `Ready`.
+The crate is split in two:
 
-Generation itself is async, not per-frame synchronous placement: `spawn_if_idle` runs
-only when idle, clones the current `WorldState` plus a draw from the session RNG, and
-spawns a batch on `AsyncComputeTaskPool`. `poll_task` polls it each frame; on completion
-it immediately folds every placed room into the real `WorldState` (open-door bookkeeping:
-matched doors removed, new doors added) so the next batch's collision checks see accurate
-state right away, then queues each room's `LdtkWorldBundle` spawn in a `SpawnQueue`
-drained at a capped rate (a few per frame) rather than all at once, so a large batch
-doesn't spike frame time when `bevy_ecs_ldtk` populates a level's tiles.
+- `src/generator/` is pure Rust, with no Bevy: the `Catalog` (every room, parsed once and
+  then immutable), the `Layout` (which rooms are placed where; append-only, and the single
+  source of truth), and the placement algorithm. Everything is in integer tiles, and the
+  tile size is read from the project, never hardcoded.
+- `src/plugin/` is the Bevy side: loading the `.ldtk`, running generation each frame,
+  and spawning or despawning `bevy_ecs_ldtk` levels for the part of the Layout near a
+  `GenerationAnchor`.
+
+Startup gates through `GenerationState`: `Loading -> Building -> Ready` (or `Failed`,
+with errors that name the offending level).
+
+Generation is **synchronous**, on the main thread, inside a per-frame budget. This
+reverses the old async design: placement turned out to be cheap (see benchmarks), and the
+frame-time problem was always tilemap spawning, which is throttled separately. Being
+synchronous is what makes seeds reproducible without snapshotting world state.
+
+Three rings around each anchor, set independently through `StreamingRadii` (also
+changeable at runtime):
+
+- **generation**: open doors within it get filled, as Layout data only.
+- **spawn**: placed rooms within it get tilemap entities.
+- **despawn**: spawned rooms beyond it are culled. Culling never touches the Layout, so
+  coming back shows the same rooms.
+
+The despawn ring is kept at least `max(10% of spawn, 2 tiles)` outside the spawn ring,
+so no setting can load and unload a room on alternate frames.
 
 ## Algorithms
 
-### Room indexing - `build_room_index` (`pipeline.rs`)
+### Catalog - `build_catalog` (`generator/catalog.rs`)
 
-Pure function: parses raw LDtk levels into `RoomDef`s (size, door positions/directions/
-widths, weight, room type), then builds the `by_door_dir` index. Doesn't touch Bevy
-`App`/`AssetServer`, so it's directly callable from tests against the real
-`assets/rooms.ldtk`.
+Parses levels into `RoomDef`s: size, doors, tags. Door direction comes from which level
+edge the entity touches, and width from its extent along that edge. Rooms are indexed by
+(direction, width) in a 4-element array, never a `HashMap`, since iteration order would
+break determinism.
 
-### Batch generation - `generate_batch` (`pipeline.rs`)
+The catalog also precomputes each door's **reservation**: the footprint of the smallest
+single-door room (a "cap") that can always fill a door of that direction and width. A
+project with no cap room for some direction fails to load with
+`NoCapRoomForDirection`. A room whose own doors' reservations overlap can never be
+placed: it's warned about at load, naming the level and doors, and is never picked as a
+start room unless named explicitly.
 
-Given the current `WorldState`, a `RoomIndex`, a camera position, a search radius, a
-session-wide room cap, and an RNG:
+### Door reservations - the placement invariant
 
-1. If no rooms exist yet, pick a random `Spawn`-type room and place it at the origin.
-2. Otherwise, repeat in passes: find open doors within `search_dist` of the camera, sort
-   by distance, and for each one build a weighted candidate list of rooms with a door
-   facing the opposite direction, shuffle it, and try each candidate in turn via
-   `try_place_room` until one succeeds. Each pass re-scans `open_doors`, so rooms newly
-   opened by one pass get picked up by the next - letting a single branch chain multiple
-   rooms deep within one async batch instead of growing by only one ring of doors per
-   frame. Passes stop once `MAX_ROOMS_PER_FRAME` rooms have been placed this batch, the
-   session-wide room cap is hit, or a pass places zero new rooms (no further progress
-   possible right now).
+Every open door keeps its reservation free. Placement must keep two invariants:
 
-The search radius and room cap are now configurable via `WorldPlugin` (`camera_spawn_dist`/
-`max_rooms`, threaded through a `GenerationConfig` resource) rather than fixed consts -
-pure plumbing, not a behavior change (the defaults are unchanged).
+1. No room body overlaps an open door's reservation, except the room filling that door.
+2. Open doors' reservations are pairwise disjoint.
 
-Placements within a batch mutate a local `WorldState` copy immediately, so later doors in
-the same batch (including later passes) see earlier placements.
+So every open door can always be closed by at least its cap room: a door can never be
+sealed, two doors never compete for the same space, and no door is born facing another
+room's wall. This replaces the old clearance boxes and the recursive bridging search
+(`find_bridging_room`), which existed to repair conflicts that now can't happen.
 
-### Spatial indexing - `SpatialHash` (`spatial_hash.rs`)
+### Placing a room - `attempt_door` (`generator/place.rs`)
 
-A uniform grid: `cells: HashMap<(i32,i32), Vec<usize>>` keyed by cell coordinate,
-storing indices into `WorldState.rooms`. `insert`/`query` both floor-divide a rect's
-four bounds by `cell_size` and enumerate every cell the rect overlaps (multi-cell for
-rects larger than one cell); `query` dedupes via a `HashSet` before returning. Scoped to
-`rooms` only (append-only, so indices stay valid) - `open_doors` (which uses
-`swap_remove`, invalidating indices) stays a linear scan. `WorldState::add_room` is the
-one place that pushes to `rooms`, inserts into the grid, and does open-door bookkeeping
-together, so the grid can't drift out of sync with the Vec.
+For one open door: list the catalog rooms with a matching door (opposite direction, same
+width), weight them (`weight` tag, optional consumer weight table, meta-generation
+quotas and closure bias), then draw without replacement until one fits. A candidate fits
+when:
 
-### Placement validation - `try_place_room` (`pipeline.rs`)
+1. Its body overlaps no placed room (queried from the room `SpatialHash`).
+2. Its body touches no open door's reservation except the door being filled, and it
+   connects every other open door it lands exactly on.
+3. Each new door it opens gets a reservation that is free of room bodies and disjoint
+   from every other open door's.
 
-Returns `Option<Vec<Room>>` (a placement plus any bridging rooms it required). Checks, in
-order:
+If no candidate fits, the attempt fails. Because of reservations this is rare: 0.0% of
+attempts in the 1M-room run below.
 
-1. New room's rect vs. `room_grid.query(...)` candidates near the new room's footprint -
-   the one unconditional, real visual-safety guarantee (no two rooms' tiles are ever
-   drawn overlapping).
-2. New room's door clearance boxes vs. `room_grid.query(...)` candidates per door
-   (queried separately from step 1, since a door's clearance box can extend past the
-   room's own footprint) - allowed only if it lands exactly on an existing door spot, or
-   if the door is actively completing a connection to an already-open door.
-3. Existing open doors' clearance boxes vs. the new room's whole footprint (linear scan
-   over `open_doors`) - closes the "doors overlap unrelated rooms" class of bug; allowed
-   only if it's the new room's own matching door.
-4. New room's doors vs. other open doors' clearance boxes (linear scan) - a collision
-   here triggers `find_bridging_room`, tried recursively (bounded by `MAX_BRIDGE_DEPTH`)
-   across every candidate that could simultaneously fill both doors, not just the first
-   one found.
+### Spatial indexing - `SpatialHash` (`generator/spatial.rs`)
 
-### Bridging - `find_bridging_room` (`types.rs`)
+A uniform grid whose cell size is the largest room dimension in the catalog, so a room
+touches at most four cells. Two indices:
 
-Given two colliding open doors, returns every room in the catalog whose placement would
-satisfy both simultaneously (not just the first match), so `try_place_room` can fall back
-to the next candidate if the first fails its own validation.
+- **rooms**: placed room bodies. Append-only.
+- **open doors**: each door's tile together with its reservation, removed when the door
+  closes. Open doors live in a slot map (`OpenDoorId` = slot plus generation), so an id
+  held across frames can't silently point at a different door.
 
-### RNG
+Every check above is a local query, so the cost of placing a room doesn't grow with the
+dungeon (see benchmarks). Lookups that need determinism sort by slot; no `HashMap` is ever
+iterated during placement.
 
-One `GenRng` resource (a `SmallRng`) is seeded once per session - from `DUNGEON_SEED` if
-set in the environment (reproducible debugging), otherwise from OS entropy. Each batch
-draws one `u64` from it to seed a fresh task-local `SmallRng` moved into the async
-closure (needed because the task must be `Send + 'static`). This replaced reseeding a
-constant every batch, which was the cause of a "repeating patterns" bug (every batch's
-"random" shuffle resolved the same way for structurally similar situations).
+### Which door next - `GenerationOrder` (`plugin/systems.rs`, `generator/frontier.rs`)
 
-### Known complexity characteristic
+- `NearestAnchor` (default): fill the open doors nearest any anchor first, up to
+  `ROOMS_PER_FRAME = 64` placements a frame. A count, not a time budget, so a fixed-seed
+  run doesn't depend on machine speed. Same seed plus the same anchor route gives the
+  same dungeon.
+- `FromOrigin` (deterministic): start at (0, 0) and always fill the open door nearest the
+  origin, out to the furthest distance any anchor has travelled plus the generation
+  radius. A lazy min-heap keyed by (distance², y, x, ids) always takes the global
+  minimum, so any route and any per-frame budget replays a prefix of one fixed sequence:
+  same seed, same dungeon, every time. Budget: 2 ms a frame (`GENERATION_BUDGET`), with
+  `MAX_PLACEMENTS_PER_FRAME = 512` as a backstop. A failed attempt abandons the door at
+  once.
 
-Steps 1-2 of `try_place_room` are now grid-backed (see "Spatial indexing" above), so
-per-room cost should scale close to flat with total room count rather than the O(n)
-per-room / O(n^2) total cost of the old linear scan. Steps 3-4 (`open_doors`) are still
-a linear scan, but that set is small (the dungeon's "frontier"), not the whole placed
-history. The benchmark history below now shows the actual before/after: per-room cost
-climb from 100->1000 rooms dropped from ~6.2x (pre-spatial-hash) to ~1.67x.
+Under `NearestAnchor`, a door that keeps failing (`DEAD_DOOR_THRESHOLD = 300` attempts) is
+abandoned and reported with `DoorAbandoned`, so the game can wall it off.
 
-Also observed post-spatial-hash: seed-reachability at higher targets dropped a lot
-(e.g. 1000 rooms: 22/50 seeds -> 1/50). This looks unrelated to speed - the leading
-suspect is a real behavior change in `try_place_room`'s bridging path: the `pretend`
-state used to validate a bridge candidate now goes through `WorldState::add_room`
-(which also does open-door bookkeeping) instead of a plain `rooms.push`, so
-`pretend.open_doors` is no longer identical to the real `open_doors` during recursive
-bridge validation like it used to be. Not yet root-caused with certainty - worth
-digging into before trusting the "reaches 1000 rooms" claim at face value.
+### Spawning - `sync_entities` (`plugin/systems.rs`)
+
+Queries the room index around each anchor (falling back to a scan when the query rect
+would cover more cells than there are rooms), and spawns the nearest unspawned rooms
+first, `ROOM_SPAWNS_PER_FRAME = 4` a frame. Spawning a tilemap is far more expensive than
+placing a room (~0.12 ms vs ~10 µs), which is why rooms are placed well ahead of the
+spawn ring and spawned in small batches.
+
+### RNG and seeds
+
+One `SmallRng` per dungeon, seeded from the plugin's seed. With no seed given, one is
+drawn up front from OS entropy and published as `GenerationSeed`, so every dungeon can
+be reported and rebuilt with `Regenerate { seed: Some(seed) }`. Never read from the
+environment.
 
 ## Current Performance
 
-As of commit `9ff4604` (2026-07-10) - lib/examples restructure, `GenerationConfig`
-(camera_spawn_dist/max_rooms now configurable via `WorldPlugin`), and a substantial
-`assets/rooms.ldtk` content change (~10% more entities in the room catalog per a rough
-count) all landed in the same commit:
+Release build, bundled 16px catalog (`ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk`).
 
-- **100 rooms**: avg 45.96 us/room (41/50 seeds reached target)
-- **250 rooms**: avg 46.51 us/room (37/50 seeds reached target)
-- **500 rooms**: avg 47.73 us/room (32/50 seeds reached target)
-- **1000 rooms**: avg 49.74 us/room (24/50 seeds reached target)
+**Reach by target** (`bench_reach_by_target`, same method as the history table below:
+50 seeds, whole catalog unweighted, deterministic order):
 
-Per-room cost climbs only ~1.08x as the target grows 10x (100 -> 1000 rooms) - flatter
-still, though the code changes here (lib restructure, config plumbing) don't touch the
-placement algorithm's cost model, so this movement is most plausibly noise plus whatever
-the larger room catalog changed about candidate availability, not a new optimization.
-Seed-reachability jumped a lot across every target (e.g. 1000 rooms: 24/50, vs 6/50 last
-run) - **can't be attributed to this commit's code changes** (none of them touch
-`try_place_room`'s validation/bridging logic), so the leading suspect is the larger
-`assets/rooms.ldtk` catalog giving `try_place_room`/bridging more candidate rooms to
-succeed with. Worth confirming next run once the asset change and code change aren't
-bundled together - right now they can't be told apart.
+- **100 rooms**: 4.77 µs/room (46/50 seeds reached target)
+- **250 rooms**: 4.91 µs/room (44/50)
+- **500 rooms**: 5.05 µs/room (44/50)
+- **1000 rooms**: 5.22 µs/room (44/50)
+
+Cost climbs 1.09x over a 10x larger target, and stops climbing after that. The 6 seeds
+that don't reach 100 rooms close off early because the unweighted catalog is mostly dead
+ends, not because placement fails; consumers wanting an endless dungeon use a weight table
+(see the `halls` example).
+
+**Scaling to a million rooms** (`bench_placement_scaling` with `BENCH_ROOMS=1000000`;
+door-count weights so the dungeon never closes, deterministic order):
+
+| Rooms | Open doors | Pick door | Place room | Failed | Elapsed | Memory (RSS) |
+|---|---|---|---|---|---|---|
+| 100k | 567 | 0.2 µs | 9.2 µs | 0.0% | 0.9 s | 25 MB |
+| 500k | 1,224 | 0.2 µs | 9.3 µs | 0.0% | 4.7 s | 36 MB |
+| 1M | 1,642 | 0.2 µs | 9.3 µs | 0.0% | 9.5 s | 49 MB |
+
+Flat per-room cost to 1M rooms (~105,000 rooms/s), about 27 bytes of memory per placed
+room. Open doors grow with the dungeon's perimeter, not its area. This run costs more per
+room than the reach benchmark because the door-count weights favour bigger,
+many-doored rooms, which have more to check.
+
+**In the app** (Chrome trace of the `testing` example): the generator takes under 0.2 ms
+of a frame while streaming; frame time is bound by vsync, with no hitches.
+
+How to run:
+
+```bash
+cargo test --release --lib bench_ -- --ignored --nocapture
+BENCH_ROOMS=1000000 cargo test --release --lib bench_placement_scaling -- --ignored --nocapture
+```
 
 ## Benchmark History
 
-Each row is one `/prep-commit` run of `generation_speed_by_target`
-(`src/world/tests.rs`): for each target room count, up to 50 different seeds are tried
-and only the runs that actually *reach* that target are averaged (a run that stalls
-early - the known bridging-fallback gap, a correctness issue, not a speed one - is
-excluded rather than averaged in, so that unrelated bug can't masquerade as a speed
-change). Cells are `avg us/room (seeds reached/50)`; `N/A` means zero seeds reached that
-target this run, which is itself meaningful (worth a Notes callout, not silently dropped).
+Each row: for each target room count, 50 seeds are tried and only the runs that *reach*
+that target are averaged (a run that closes early is excluded, so it can't masquerade as
+a speed change). Cells are `avg us/room (seeds reached/50)`; `N/A` means no seed reached
+that target. Rows up to `9ff4604` are the old async implementation
+(`generation_speed_by_target`, `assets/rooms.ldtk`); from the rewrite on,
+`bench_reach_by_target` with the 16px fixed-doors catalog, so the catalog differs too.
 
 | Date       | Commit        | 100 rooms     | 250 rooms     | 500 rooms      | 1000 rooms     | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 |------------|---------------|---------------|---------------|----------------|----------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -161,25 +185,21 @@ target this run, which is itself meaningful (worth a Notes callout, not silently
 | 2026-07-08 | `105aa0a`     | 33.13 (30/50) | 38.73 (18/50) | 44.87 (7/50)   | 55.31 (1/50)   | First post-spatial-hashing measurement (feature/spatial-hashing rebased onto main). Per-room cost flattened a lot (see Current Performance), but seed-reachability at higher targets dropped sharply - suspected bridging-validation bug (pretend.add_room now runs open-door bookkeeping it didn't before), not a speed regression. Needs follow-up before trusting the 1000-room number.                                                                                                                         |
 | 2026-07-10 | `105aa0a`+wip | 34.12 (34/50) | 35.13 (23/50) | 37.54 (15/50)  | 39.46 (6/50)   | Uncommitted working tree on top of 105aa0a - adds multi-pass branch chaining to generate_batch (chains a branch multiple rooms deep per async batch) and a SpawnQueue frame-rate limiter to poll_task; numbers reflect the working tree, not a specific commit. Per-room cost climb flattened further (~1.16x vs ~1.67x), and 1000-room seed-reachability partially recovered (6/50 vs 1/50) but is still well short of the pre-spatial-hash 22/50 - the suspected bridging-validation regression remains unfixed. |
 | 2026-07-10 | `9ff4604`     | 45.96 (41/50) | 46.51 (37/50) | 47.73 (32/50)  | 49.74 (24/50)  | lib/examples restructure plus GenerationConfig (camera_spawn_dist/max_rooms configurable, no algorithm change) bundled with a substantial assets/rooms.ldtk content change (~10% more entities). Seed-reachability jumped a lot at every target; since none of this commit's code changes touch try_place_room/bridging, the larger room catalog is the leading suspect, not the code - not yet isolated from the asset change to confirm.                                                                         |
+| 2026-11-11 | rewrite       | 4.77 (46/50)  | 4.91 (44/50)  | 5.05 (44/50)   | 5.22 (44/50)   | Synchronous rewrite (`rewrite/generator`): door reservations, spatial index for rooms and open doors, deterministic `FromOrigin` order. ~10x cheaper per room than the async version at 1000 rooms, cost flat across targets, and reachability at 1000 rooms up from 24/50 to 44/50. Different catalog from earlier rows, so the absolute numbers aren't a like-for-like comparison; the flatness and reach are the meaningful part. Scaling checked separately to 1M rooms (see Current Performance). |
 
 ### Performance Chart
 
-One combined chart, x-axis = commit history, one line per target - regenerated (one more
-x-axis entry, one more point per line) every `/prep-commit` run. Mermaid's `xychart-beta`
-has no per-line legend, so this relies on the four targets' natural ordering instead: the
-1000-room line sits on top, 100-room on the bottom, in that order, in every run so far.
-Watch this once spatial hashing lands: today each line should be roughly flat run-to-run
-(same version, same cost), and the *gap* between the top and bottom lines is the number
-that should shrink - the four lines converging toward each other is exactly what "cost no
-longer depends much on room count" looks like.
+x-axis = commit history, one line per target; Mermaid's `xychart-beta` has no per-line
+legend. Lines from top to bottom: 1000, 500, 250, 100 rooms. The gap between the top and
+bottom line is "how much cost depends on dungeon size"; at the rewrite it's gone.
 
 ```mermaid
 xychart-beta
     title "Avg cost by commit (us/room) - top to bottom: 1000, 500, 250, 100 rooms"
-    x-axis ["12443ae", "105aa0a", "105aa0a+wip", "9ff4604"]
+    x-axis ["12443ae", "105aa0a", "105aa0a+wip", "9ff4604", "rewrite"]
     y-axis "us/room" 0 --> 300
-    line [236.18, 55.31, 39.46, 49.74]
-    line [118.93, 44.87, 37.54, 47.73]
-    line [68.46, 38.73, 35.13, 46.51]
-    line [38.37, 33.13, 34.12, 45.96]
+    line [236.18, 55.31, 39.46, 49.74, 5.22]
+    line [118.93, 44.87, 37.54, 47.73, 5.05]
+    line [68.46, 38.73, 35.13, 46.51, 4.91]
+    line [38.37, 33.13, 34.12, 45.96, 4.77]
 ```
