@@ -110,19 +110,27 @@ iterated during placement.
 ### Which door next - `GenerationOrder` (`plugin/systems.rs`, `generator/frontier.rs`)
 
 - `NearestAnchor` (default): fill the open doors nearest any anchor first, up to
-  `ROOMS_PER_FRAME = 64` placements a frame. A count, not a time budget, so a fixed-seed
+  `PlacementBudget::nearest_anchor_rooms` (default 64) placements a frame. A count, not a time budget, so a fixed-seed
   run doesn't depend on machine speed. Same seed plus the same anchor route gives the
   same dungeon.
 - `FromOrigin` (deterministic): start at (0, 0) and always fill the open door nearest the
   origin, out to the furthest distance any anchor has travelled plus the generation
   radius. A lazy min-heap keyed by (distance², y, x, ids) always takes the global
   minimum, so any route and any per-frame budget replays a prefix of one fixed sequence:
-  same seed, same dungeon, every time. Budget: 2 ms a frame (`GENERATION_BUDGET`), with
-  `MAX_PLACEMENTS_PER_FRAME = 512` as a backstop. A failed attempt abandons the door at
-  once.
+  same seed, same dungeon, every time. Budget: `PlacementBudget::from_origin_time` (default
+  2 ms a frame), with `from_origin_max_rooms` (default 512) as a backstop.
 
-Under `NearestAnchor`, a door that keeps failing (`DEAD_DOOR_THRESHOLD = 300` attempts) is
-abandoned and reported with `DoorAbandoned`, so the game can wall it off.
+`PlacementBudget` is a resource (`GeneratorPlugin::with_placement_budget`), changeable at
+runtime.
+
+Under either order, a door whose attempt fails is abandoned at once and reported with
+`DoorAbandoned`, so the game can wall it off. Reservations guarantee every open door can
+take its cap room, so a failure only means the weights excluded every candidate that fits
+(a consumer table zeroing them, a quota, a depth gate), and a retry would fail the same
+way. Before reservations, doors failed temporarily while their neighbourhood was still
+growing, so `NearestAnchor` retried each one up to 300 times; that retry counter is gone.
+On the bundled map no attempt fails at all (end-to-end test, and the `meta` example's
+fixed-seed layout is identical before and after the change).
 
 ### Spawning - `sync_entities` (`plugin/systems.rs`)
 

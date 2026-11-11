@@ -66,8 +66,6 @@ FPS is capped by the recording monitor's 60 Hz vsync.*
 - An 18px project. The crate is grid-agnostic and the 512px Mossy Cavern map
   is tested locally (its art can't be redistributed), but no 18px map exists
   yet.
-- Placement budget configuration (currently fixed: 64 rooms a frame for
-  `NearestAnchor`, 2 ms a frame for `FromOrigin`).
 - Tag transition table wiring (`WeightConfig::tag_transition`).
 - Saving and loading a layout.
 - Hot reload of the `.ldtk` project.
@@ -93,7 +91,7 @@ fn main() {
 }
 ```
 
-Builder options: `with_generation_radius`, `with_culling`, `with_order`, `with_spawn_budget`, `with_door_source`,
+Builder options: `with_generation_radius`, `with_culling`, `with_order`, `with_placement_budget`, `with_spawn_budget`, `with_door_source`,
 `with_start`, `with_max_rooms`, `with_weight_config`.
 
 ## Examples

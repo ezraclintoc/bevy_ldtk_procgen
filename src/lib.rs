@@ -44,7 +44,8 @@ pub mod prelude {
     pub use crate::plugin::{
         CatalogRes, CullingPolicy, DoorAbandoned, GenerationAnchor, GenerationFailed,
         GenerationOrder, GenerationSeed, GenerationSet, GenerationSettled, GenerationState,
-        GeneratorPlugin, LayoutRes, OriginReach, Regenerate, RoomDespawned, RoomPlaced,
-        RoomSpawned, RoomWeights, SpawnBudget, SpawnRate, StreamingRadii, apply_weights,
+        GeneratorPlugin, LayoutRes, OriginReach, PlacementBudget, Regenerate, RoomDespawned,
+        RoomPlaced, RoomSpawned, RoomWeights, SpawnBudget, SpawnRate, StreamingRadii,
+        apply_weights,
     };
 }

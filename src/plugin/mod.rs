@@ -19,7 +19,7 @@ pub use events::{
     RoomSpawned,
 };
 pub use load::GenerationState;
-use systems::{DoorAttempts, GenRng, GenerationConfig, PlacementCountersRes};
+use systems::{GenRng, GenerationConfig, PlacementCountersRes};
 pub use systems::{RoomWeights, apply_weights};
 
 /// The loaded catalog, behind an `Arc` so it is cheap to share and impossible
@@ -191,6 +191,42 @@ pub enum GenerationOrder {
     FromOrigin,
 }
 
+/// How much placement (Layout data, no entities) each frame may do. Placing
+/// a room costs ~10 µs whatever the dungeon's size, so these mostly decide
+/// how fast generation keeps up with a fast-moving anchor. A resource, so
+/// it can change at runtime, e.g. raised behind a loading screen.
+///
+/// The two orders are budgeted differently on purpose. Under
+/// [`GenerationOrder::NearestAnchor`] the anchor moves between frames, so
+/// how many rooms a frame places changes which doors are nearest next: a
+/// time budget would make a fixed-seed run depend on machine speed, so it
+/// is a count. [`GenerationOrder::FromOrigin`]'s sequence doesn't depend on
+/// how many rooms each frame gets through, so it can use time.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PlacementBudget {
+    /// Rooms placed per frame at most under `NearestAnchor`. Default 64
+    /// (~0.6 ms here).
+    pub nearest_anchor_rooms: usize,
+    /// Time spent placing per frame under `FromOrigin`. Default 2 ms
+    /// (~200 rooms here), enough for the disc to keep up with a fast
+    /// anchor.
+    pub from_origin_time: std::time::Duration,
+    /// Rooms placed per frame at most under `FromOrigin`, alongside the
+    /// time budget, so a coarse clock can't let one frame run away.
+    /// Default 512.
+    pub from_origin_max_rooms: usize,
+}
+
+impl Default for PlacementBudget {
+    fn default() -> Self {
+        Self {
+            nearest_anchor_rooms: 64,
+            from_origin_time: std::time::Duration::from_millis(2),
+            from_origin_max_rooms: 512,
+        }
+    }
+}
+
 /// How much tilemap the plugin may spawn per frame, counted in tiles of room
 /// area: spawning a room costs in proportion to its tiles
 /// (`bevy_ecs_tilemap` makes one entity per tile), so a tile budget treats a
@@ -304,6 +340,7 @@ pub struct GeneratorPlugin {
     start: StartRoom,
     culling: CullingPolicy,
     order: GenerationOrder,
+    placement_budget: PlacementBudget,
     spawn_budget: SpawnBudget,
     door_source: DoorSource,
     weight_config: crate::generator::weight::WeightConfig,
@@ -332,6 +369,7 @@ impl GeneratorPlugin {
             start: StartRoom::default(),
             culling: CullingPolicy::radius(view_radius),
             order: GenerationOrder::default(),
+            placement_budget: PlacementBudget::default(),
             spawn_budget: SpawnBudget::default(),
             door_source: DoorSource::default(),
             weight_config: Default::default(),
@@ -382,6 +420,12 @@ impl GeneratorPlugin {
     /// catalog, so a test project needs no tagging to load.
     pub fn with_start(mut self, start: StartRoom) -> Self {
         self.start = start;
+        self
+    }
+
+    /// How much placement each frame may do (see [`PlacementBudget`]).
+    pub fn with_placement_budget(mut self, budget: PlacementBudget) -> Self {
+        self.placement_budget = budget;
         self
     }
 
@@ -440,6 +484,7 @@ impl Plugin for GeneratorPlugin {
                 culling: self.culling,
             })
             .insert_resource(self.order)
+            .insert_resource(self.placement_budget)
             .insert_resource(self.spawn_budget)
             .init_resource::<SpawnRate>()
             .init_resource::<systems::SpawnController>()
@@ -447,7 +492,6 @@ impl Plugin for GeneratorPlugin {
             .init_resource::<systems::OriginFrontierRes>()
             .init_resource::<systems::SpawnCursor>()
             .init_resource::<RoomWeights>()
-            .init_resource::<DoorAttempts>()
             .init_resource::<PlacementCountersRes>()
             .init_resource::<CatalogRes>()
             .init_resource::<LayoutRes>()

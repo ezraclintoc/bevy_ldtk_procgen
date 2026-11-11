@@ -1,8 +1,7 @@
 //! `enforce_ldtk_settings`, `generate` (the synchronous placement driver,
 //! ARCHITECTURE.md §7), and `sync_entities` (the spawn/cull queue drain).
 
-use std::collections::{HashMap, HashSet};
-use std::time::Duration;
+use std::collections::HashSet;
 
 use bevy::platform::time::Instant;
 use bevy::prelude::*;
@@ -24,42 +23,8 @@ use super::events::{
 use super::load::{GenerationState, LdtkHandle};
 use super::{
     CatalogRes, CullingPolicy, GenerationAnchor, GenerationOrder, GenerationSeed, LayoutRes,
-    OriginReach, SpawnBudget, SpawnRate, StreamingRadii,
+    OriginReach, PlacementBudget, SpawnBudget, SpawnRate, StreamingRadii,
 };
-
-/// After this many exhausted attempts (`attempt_door` returning `None`,
-/// each one a full candidate-pool exhaustion in `place.rs`'s terms), a door
-/// is abandoned rather than retried forever. See DESIGN.md §9, "Dead doors".
-///
-/// An exhausted attempt is not proof of permanent blockage: when the
-/// frontier around a door is still growing, candidates fail only
-/// temporarily and the door becomes fillable once the neighbourhood
-/// settles. Measured on the bundled catalog (seed 1234): every door fills
-/// eventually, but a door near churn can stay unfillable for dozens of
-/// rounds — 3 strikes abandoned 6 fillable doors and capped the dungeon at
-/// 41 rooms, while a high threshold lets the same run reach 57. DESIGN.md
-/// §9's "repeated" is therefore dozens, not a handful; the real fix is the
-/// retry-suppression note below, and a premature abandon is strictly worse
-/// than a bounded re-check (the check is cheap: one candidate scan).
-const DEAD_DOOR_THRESHOLD: u32 = 300;
-
-/// Per-frame placement budgets, standing in for `DESIGN.md` §5's
-/// `GenerationBudget` (not yet public API). Placement measures ~10 µs per
-/// room independent of dungeon size.
-///
-/// `NearestAnchor` is capped by COUNT: the anchor moves between frames, so
-/// how many rooms a frame places changes which doors are nearest next — a
-/// time budget would make a fixed-seed run depend on machine speed.
-const ROOMS_PER_FRAME: usize = 64;
-
-/// `FromOrigin` is capped by TIME (~200 rooms a frame), enough for its disc
-/// to keep pace with a fast anchor. That costs it nothing: its sequence
-/// doesn't depend on how many rooms each frame gets through.
-const GENERATION_BUDGET: Duration = Duration::from_millis(2);
-
-/// Hard cap alongside [`GENERATION_BUDGET`], so a coarse clock can't let one
-/// frame run away.
-const MAX_PLACEMENTS_PER_FRAME: usize = 512;
 
 /// The consumer's once-per-frame weight table (DESIGN.md §9). Written by a
 /// consumer system piped into the public [`apply_weights`] — never mutated
@@ -169,13 +134,6 @@ pub(crate) struct GenerationConfig {
     /// with no tags at all, resolving to empty rules).
     pub resolved: Option<ResolvedWeights>,
 }
-
-/// Failure count per door. Point-looked-up and incremented by exact key,
-/// never iterated as a whole during placement, so this `HashMap` doesn't
-/// reintroduce the iteration-order hazard `DESIGN.md` §7 warns about — same
-/// reasoning as `Catalog::door_reservation`.
-#[derive(Resource, Default, Deref, DerefMut)]
-pub(crate) struct DoorAttempts(HashMap<OpenDoorId, u32>);
 
 /// Engine-maintained placement counters (DESIGN.md §9) — the per-placement
 /// memory a once-per-frame weight table lacks. Updated by `generate` on
@@ -401,9 +359,9 @@ pub(crate) fn generate(
     catalog: Res<CatalogRes>,
     mut layout: ResMut<LayoutRes>,
     mut rng: ResMut<GenRng>,
-    mut attempts: ResMut<DoorAttempts>,
     mut counters: ResMut<PlacementCountersRes>,
     room_weights: Res<RoomWeights>,
+    budget: Res<PlacementBudget>,
     config: Res<GenerationConfig>,
     radii: Res<StreamingRadii>,
     order: Res<GenerationOrder>,
@@ -517,10 +475,12 @@ pub(crate) fn generate(
 
     loop {
         let over_budget = match *order {
-            GenerationOrder::NearestAnchor => placed_this_frame >= ROOMS_PER_FRAME,
+            GenerationOrder::NearestAnchor => {
+                placed_this_frame >= budget.nearest_anchor_rooms.max(1)
+            }
             GenerationOrder::FromOrigin => {
-                placed_this_frame >= MAX_PLACEMENTS_PER_FRAME
-                    || started.elapsed() >= GENERATION_BUDGET
+                placed_this_frame >= budget.from_origin_max_rooms.max(1)
+                    || started.elapsed() >= budget.from_origin_time
             }
         };
         if over_budget || ceiling.is_some_and(|max| counters.progress >= max) {
@@ -558,7 +518,6 @@ pub(crate) fn generate(
         match attempt_door(&mut layout, &catalog, door_id, &mut rng.0, weight_params) {
             Some(placement_id) => {
                 placed_this_frame += 1;
-                attempts.remove(&door_id);
                 if let Some(placement) = layout.get(placement_id) {
                     // Counters must reflect the placement that just
                     // happened, before the next door weights against them —
@@ -583,21 +542,16 @@ pub(crate) fn generate(
                     });
                 }
             }
-            // Deterministic order cannot retry: a retry later would draw
-            // from the RNG at a point that depends on frame timing, and the
-            // door would block the whole queue meanwhile. With reservations
-            // every open door is fillable by its cap, so this only happens
-            // when the weight table zeroes every candidate.
-            None if *order == GenerationOrder::FromOrigin => {
-                abandon_door(&mut layout, &catalog, door_id, &mut abandoned_events);
-            }
+            // One exhausted pool and the door is dead (DESIGN.md §9). With
+            // reservations every open door can always take its cap room, so
+            // a failure means the weights excluded every candidate that
+            // fits (a consumer table zeroing them, a quota, a depth gate),
+            // not a neighbourhood still settling, so retrying would only
+            // fail again. Under `FromOrigin` a retry couldn't happen anyway:
+            // it would draw from the RNG at a point that depends on frame
+            // timing, and the door would block the whole queue meanwhile.
             None => {
-                let failures = attempts.entry(door_id).or_insert(0);
-                *failures += 1;
-                if *failures >= DEAD_DOOR_THRESHOLD {
-                    attempts.remove(&door_id);
-                    abandon_door(&mut layout, &catalog, door_id, &mut abandoned_events);
-                }
+                abandon_door(&mut layout, &catalog, door_id, &mut abandoned_events);
             }
         }
     }
@@ -653,7 +607,6 @@ pub(crate) fn apply_regeneration(
     mut layout: ResMut<LayoutRes>,
     mut rng: ResMut<GenRng>,
     mut current_seed: ResMut<GenerationSeed>,
-    mut attempts: ResMut<DoorAttempts>,
     mut counters: ResMut<PlacementCountersRes>,
     mut frontier: ResMut<OriginFrontierRes>,
     mut reach: ResMut<OriginReach>,
@@ -687,7 +640,6 @@ pub(crate) fn apply_regeneration(
     *frontier = OriginFrontierRes::default();
     *reach = OriginReach::default();
     *cursor = SpawnCursor::default();
-    *attempts = DoorAttempts::default();
     *counters = PlacementCountersRes(PlacementCounters::new(&catalog));
     let seed = resolve_seed(seed);
     *rng = GenRng::new(seed);
