@@ -16,13 +16,13 @@ jobs:
         include:
           - os: ubuntu-latest
             name: linux
-            binary: dungeon
+            binary: testing
           - os: windows-latest
             name: windows
-            binary: dungeon.exe
+            binary: testing.exe
           - os: macos-latest
             name: macos
-            binary: dungeon
+            binary: testing
     steps:
       - uses: actions/checkout@v4
 
@@ -56,7 +56,10 @@ jobs:
         with:
           timeout_minutes: 30
           max_attempts: 3
-          command: cargo build --release --example dungeon
+          command: cargo build --release --example testing
+
+      - name: Test
+        run: cargo test --release
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

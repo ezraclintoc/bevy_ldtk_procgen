@@ -1410,6 +1410,65 @@ mod tests {
         );
     }
 
+    /// `spec.md`'s benchmark-history row: for each target, 50 seeds with the
+    /// whole catalog unweighted, averaging cost per room over the seeds that
+    /// reach it (a dungeon that closes off first is excluded, not averaged in).
+    /// Run with `cargo test --release --lib bench_ -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run explicitly in release"]
+    fn bench_reach_by_target() {
+        let catalog = load_catalog();
+        let seeds = 50u64;
+        println!("target   us/room   seeds reached");
+        for target in [100usize, 250, 500, 1000] {
+            let (mut reached, mut total) = (0u32, std::time::Duration::ZERO);
+            for seed in 0..seeds {
+                let mut layout = Layout::default();
+                let mut rng = SmallRng::seed_from_u64(seed);
+                let mut frontier = crate::generator::frontier::OriginFrontier::default();
+                let t0 = std::time::Instant::now();
+                place_start_room(
+                    &mut layout,
+                    &catalog,
+                    &StartRoom::Any,
+                    TilePos { x: 0, y: 0 },
+                    &mut rng,
+                    WeightParams::default(),
+                )
+                .unwrap();
+                while layout.placed_count() < target {
+                    let Some(door) = frontier.next(&layout, &catalog, f32::INFINITY) else {
+                        break;
+                    };
+                    if attempt_door(
+                        &mut layout,
+                        &catalog,
+                        door,
+                        &mut rng,
+                        WeightParams::default(),
+                    )
+                    .is_none()
+                    {
+                        layout.close_door(door);
+                    }
+                }
+                if layout.placed_count() >= target {
+                    reached += 1;
+                    total += t0.elapsed();
+                }
+            }
+            let per_room = if reached == 0 {
+                "N/A".to_owned()
+            } else {
+                format!(
+                    "{:.2}",
+                    total.as_secs_f64() * 1e6 / (f64::from(reached) * target as f64)
+                )
+            };
+            println!("{target:>6}   {per_room:>7}   {reached}/{seeds}");
+        }
+    }
+
     /// Cost of placement as the dungeon grows, in deterministic order: always
     /// fill the open door nearest the origin. Not a correctness test — run
     /// with `cargo test --release --lib bench_ -- --ignored --nocapture`.
@@ -1437,13 +1496,29 @@ mod tests {
         .unwrap();
 
         let mut frontier = crate::generator::frontier::OriginFrontier::default();
-        let target = 100_000;
-        let bucket = 10_000;
+        // `BENCH_ROOMS=1000000` for the million-room run.
+        let target: usize = std::env::var("BENCH_ROOMS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(100_000);
+        let bucket = (target / 10).max(1);
+        // Resident memory, Linux only (blank elsewhere).
+        let rss_mb = || {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("VmRSS:"))
+                        .and_then(|l| l.split_whitespace().nth(1)?.parse::<f64>().ok())
+                })
+                .map_or(String::new(), |kb| format!("{:.0} MB", kb / 1024.0))
+        };
+        let started = std::time::Instant::now();
         let mut t_place = std::time::Duration::ZERO;
         let mut t_pick = std::time::Duration::ZERO;
         let mut attempts = 0u32;
         let mut failures = 0u32;
-        println!("rooms    open   pick-door/op   attempt/op   fail%");
+        println!("  rooms    open   pick-door/op   attempt/op   fail%   elapsed   rss");
         while layout.placed_count() < target {
             let t0 = std::time::Instant::now();
             let Some(door) = frontier.next(&layout, &catalog, f32::INFINITY) else {
@@ -1461,12 +1536,14 @@ mod tests {
             attempts += 1;
             if layout.placed_count() != before && layout.placed_count() % bucket == 0 {
                 println!(
-                    "{:>6} {:>6}   {:>9.1}us   {:>8.1}us   {:>4.1}",
+                    "{:>7} {:>7}   {:>9.1}us   {:>8.1}us   {:>4.1}   {:>6.1}s   {}",
                     layout.placed_count(),
                     layout.open_doors().count(),
                     t_pick.as_secs_f64() * 1e6 / f64::from(attempts),
                     t_place.as_secs_f64() * 1e6 / f64::from(attempts),
                     100.0 * f64::from(failures) / f64::from(attempts),
+                    started.elapsed().as_secs_f64(),
+                    rss_mb(),
                 );
                 t_place = std::time::Duration::ZERO;
                 t_pick = std::time::Duration::ZERO;
