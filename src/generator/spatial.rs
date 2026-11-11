@@ -27,6 +27,21 @@ impl<T: Copy> SpatialHash<T> {
     }
 }
 
+impl<T: Copy + PartialEq> SpatialHash<T> {
+    /// Undoes one `insert(rect, value)`. `rect` must be the rect it was
+    /// inserted with — that is what names the cells to look in.
+    pub fn remove(&mut self, rect: TileRect, value: T) {
+        for cell in cells_touching(self.cell_size, rect) {
+            if let Some(values) = self.cells.get_mut(&cell) {
+                values.retain(|v| *v != value);
+                if values.is_empty() {
+                    self.cells.remove(&cell);
+                }
+            }
+        }
+    }
+}
+
 /// `div_euclid`, not `/`: tile coordinates go negative, and plain division
 /// truncates toward zero instead of flooring.
 ///

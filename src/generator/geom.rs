@@ -30,7 +30,7 @@ pub struct OpenDoorId {
 /// A tile coordinate in `generator/`'s y-up frame. Integer everywhere on
 /// purpose: two integer adds replace the old float comparisons, so no epsilon
 /// and no `float_cmp` (`ARCHITECTURE.md` §3).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 pub struct TilePos {
     /// Column, increasing to the right.
     pub x: i32,
@@ -60,7 +60,7 @@ impl std::ops::Sub for TilePos {
     }
 }
 
-/// A size in TILES — a room's footprint, or the extent of a clearance strip.
+/// A size in TILES — a room's footprint, or a door reservation.
 /// Pixels only enter the picture at the plugin boundary (`ARCHITECTURE.md` §2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TileSize {
@@ -117,6 +117,41 @@ impl TileRect {
         let dy = (self.min.y - pos.y).max(pos.y - max.y).max(0) as f32;
         (dx * dx + dy * dy).sqrt()
     }
+
+    /// The smallest rect covering both.
+    pub fn union(self, other: TileRect) -> TileRect {
+        let (a, b) = (self.max(), other.max());
+        let min = TilePos {
+            x: self.min.x.min(other.min.x),
+            y: self.min.y.min(other.min.y),
+        };
+        let max = TilePos {
+            x: a.x.max(b.x),
+            y: a.y.max(b.y),
+        };
+        TileRect {
+            min,
+            size: TileSize {
+                width: (max.x - min.x).unsigned_abs(),
+                height: (max.y - min.y).unsigned_abs(),
+            },
+        }
+    }
+
+    /// This rect grown by `by` tiles on every side.
+    pub fn inflate(self, by: u32) -> TileRect {
+        let grow = i32::try_from(by).unwrap_or(i32::MAX);
+        TileRect {
+            min: TilePos {
+                x: self.min.x.saturating_sub(grow),
+                y: self.min.y.saturating_sub(grow),
+            },
+            size: TileSize {
+                width: self.size.width.saturating_add(by.saturating_mul(2)),
+                height: self.size.height.saturating_add(by.saturating_mul(2)),
+            },
+        }
+    }
 }
 
 /// Strict `<`: two rects sharing only an edge do not overlap.
@@ -151,6 +186,17 @@ impl Dir {
             Dir::W => Dir::E,
         }
     }
+    /// One tile step the way a door facing `self` opens — e.g. a door facing
+    /// `N` sits on a room's top edge, so the space beyond it is one row
+    /// further north (higher y, this crate's y-up convention).
+    pub const fn step(self) -> TilePos {
+        match self {
+            Dir::N => TilePos { x: 0, y: 1 },
+            Dir::S => TilePos { x: 0, y: -1 },
+            Dir::E => TilePos { x: 1, y: 0 },
+            Dir::W => TilePos { x: -1, y: 0 },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -165,6 +211,14 @@ mod tests {
                 height: 3,
             },
         }
+    }
+
+    #[test]
+    fn step_points_one_tile_away_from_each_direction() {
+        assert_eq!(Dir::N.step(), TilePos { x: 0, y: 1 });
+        assert_eq!(Dir::S.step(), TilePos { x: 0, y: -1 });
+        assert_eq!(Dir::E.step(), TilePos { x: 1, y: 0 });
+        assert_eq!(Dir::W.step(), TilePos { x: -1, y: 0 });
     }
 
     #[test]

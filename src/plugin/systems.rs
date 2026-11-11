@@ -2,7 +2,9 @@
 //! ARCHITECTURE.md §7), and `sync_entities` (the spawn/cull queue drain).
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
+use bevy::platform::time::Instant;
 use bevy::prelude::*;
 use bevy_ecs_ldtk::prelude::*;
 use rand::SeedableRng;
@@ -10,7 +12,8 @@ use rand::rngs::SmallRng;
 
 use crate::generator::catalog::{Catalog, RoomDef, TagId};
 use crate::generator::error::CatalogErrors;
-use crate::generator::geom::{OpenDoorId, PlacementId, RoomId, TilePos, TileRect};
+use crate::generator::frontier::OriginFrontier;
+use crate::generator::geom::{OpenDoorId, PlacementId, RoomId, TilePos, TileRect, TileSize};
 use crate::generator::layout::{Layout, open_door_dir, open_door_pos};
 use crate::generator::place::{StartRoom, WeightParams, attempt_door, place_start_room};
 use crate::generator::weight::{CountBy, PlacementCounters, ResolvedWeights, WeightContext};
@@ -19,7 +22,10 @@ use super::events::{
     DoorAbandoned, GenerationFailed, Regenerate, RoomDespawned, RoomPlaced, RoomSpawned,
 };
 use super::load::{GenerationState, LdtkHandle};
-use super::{CatalogRes, CullingPolicy, GenerationAnchor, LayoutRes};
+use super::{
+    CatalogRes, CullingPolicy, GenerationAnchor, GenerationOrder, GenerationSeed, LayoutRes,
+    OriginReach, StreamingRadii,
+};
 
 /// After this many exhausted attempts (`attempt_door` returning `None`,
 /// each one a full candidate-pool exhaustion in `place.rs`'s terms), a door
@@ -37,11 +43,23 @@ use super::{CatalogRes, CullingPolicy, GenerationAnchor, LayoutRes};
 /// than a bounded re-check (the check is cheap: one candidate scan).
 const DEAD_DOOR_THRESHOLD: u32 = 300;
 
-/// Simple per-frame room cap standing in for `DESIGN.md` §5's full
-/// `GenerationBudget` (`Immediate`/`RoomsPerFrame`/`TimeBudget`), which
-/// isn't wired into `GeneratorPlugin` yet — this is a fixed number, not the
-/// final API.
-const ROOMS_PER_FRAME: usize = 10;
+/// Per-frame placement budgets, standing in for `DESIGN.md` §5's
+/// `GenerationBudget` (not yet public API). Placement measures ~10 µs per
+/// room independent of dungeon size.
+///
+/// `NearestAnchor` is capped by COUNT: the anchor moves between frames, so
+/// how many rooms a frame places changes which doors are nearest next — a
+/// time budget would make a fixed-seed run depend on machine speed.
+const ROOMS_PER_FRAME: usize = 64;
+
+/// `FromOrigin` is capped by TIME (~200 rooms a frame), enough for its disc
+/// to keep pace with a fast anchor. That costs it nothing: its sequence
+/// doesn't depend on how many rooms each frame gets through.
+const GENERATION_BUDGET: Duration = Duration::from_millis(2);
+
+/// Hard cap alongside [`GENERATION_BUDGET`], so a coarse clock can't let one
+/// frame run away.
+const MAX_PLACEMENTS_PER_FRAME: usize = 512;
 
 /// The consumer's once-per-frame weight table (DESIGN.md §9). Written by a
 /// consumer system piped into the public [`apply_weights`] — never mutated
@@ -73,28 +91,68 @@ pub fn apply_weights(In(table): In<Vec<f32>>, mut room_weights: ResMut<RoomWeigh
     *room_weights = RoomWeights(Some(table));
 }
 
-/// How many room entities `sync_entities` introduces per frame. Entity
-/// spawning — `bevy_ecs_ldtk` materializing tilemaps — is throttled
-/// separately and independently of generation itself (DESIGN.md §5): the
-/// constant above caps placement work, this caps the tilemap-spawn cost.
-const ROOM_SPAWNS_PER_FRAME: usize = 2;
+/// How many ROOMS (one `bevy_ecs_ldtk` world each — not doors) `sync_entities`
+/// spawns per frame. Entity spawning — `bevy_ecs_ldtk` materializing
+/// tilemaps — is throttled separately from generation (DESIGN.md §5): the
+/// budget above caps placement math, this caps tilemap-spawn cost, measured
+/// at ~0.12 ms per room plus a fixed per-burst cost. Nearest rooms spawn
+/// first, so a low cap only delays the far edge.
+const ROOM_SPAWNS_PER_FRAME: usize = 4;
 
-/// A room is despawned beyond `CullingPolicy::Radius` times this margin,
-/// but respawned within the radius itself — the two thresholds make the
-/// hysteresis band DESIGN.md §8 requires, so an anchor wobbling on the
-/// boundary doesn't flicker rooms in and out.
-const CULL_HYSTERESIS: f32 = 1.25;
+/// Above this many spatial-hash cells, a "what's near the anchor" query is
+/// answered by a plain scan instead: a huge radius covers more cells than
+/// there are things to find.
+fn scan_is_cheaper(rect: TileRect, cell_size: u32, items: usize) -> bool {
+    let cell = f64::from(cell_size.max(1));
+    let cells =
+        (f64::from(rect.size.width) / cell + 1.0) * (f64::from(rect.size.height) / cell + 1.0);
+    cells > items as f64
+}
+
+/// The square of tiles within `radius` of `center`, or `None` if the radius
+/// is too large to express (or not finite) — the caller then scans.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // range-checked
+fn square_around(center: TilePos, radius: f32) -> Option<TileRect> {
+    if !radius.is_finite() || !(0.0..1.0e6).contains(&radius) {
+        return None;
+    }
+    let r = radius.ceil() as u32;
+    Some(
+        TileRect {
+            min: center,
+            size: TileSize {
+                width: 1,
+                height: 1,
+            },
+        }
+        .inflate(r),
+    )
+}
+
+/// Deterministic generation's frontier. The origin is tile (0, 0), so
+/// `Default` is the real initial state.
+#[derive(Resource, Default)]
+pub(crate) struct OriginFrontierRes(pub OriginFrontier);
+
+/// Under `CullingPolicy::Disabled` every placement spawns, in order; this is
+/// how many already have, so the spawn pass doesn't rescan them each frame.
+#[derive(Resource, Default)]
+pub(crate) struct SpawnCursor(usize);
 
 #[derive(Resource, Deref, DerefMut)]
 pub(crate) struct GenRng(pub SmallRng);
 
 impl GenRng {
-    pub(crate) fn new(seed: Option<u64>) -> Self {
-        match seed {
-            Some(seed) => Self(SmallRng::seed_from_u64(seed)),
-            None => Self(SmallRng::from_rng(&mut rand::rng())),
-        }
+    pub(crate) fn new(seed: u64) -> Self {
+        Self(SmallRng::seed_from_u64(seed))
     }
+}
+
+/// The seed to generate from: the one asked for, or a fresh random one.
+/// Drawn as a number rather than seeding the RNG from entropy directly, so
+/// even a random dungeon has a seed to report and rebuild (`GenerationSeed`).
+pub(crate) fn resolve_seed(seed: Option<u64>) -> u64 {
+    seed.unwrap_or_else(rand::random)
 }
 
 /// `generation_radius`, `max_rooms`, and `start`, plumbed from
@@ -111,10 +169,8 @@ impl GenRng {
 /// (DESIGN.md §2).
 #[derive(Resource, Clone)]
 pub(crate) struct GenerationConfig {
-    pub generation_radius: f32,
     pub max_rooms: Option<(usize, CountBy)>,
     pub start: StartRoom,
-    pub culling: CullingPolicy,
     pub weight_config: crate::generator::weight::WeightConfig,
     /// Set when the catalog loads; `None` until then (and for catalogs
     /// with no tags at all, resolving to empty rules).
@@ -124,7 +180,7 @@ pub(crate) struct GenerationConfig {
 /// Failure count per door. Point-looked-up and incremented by exact key,
 /// never iterated as a whole during placement, so this `HashMap` doesn't
 /// reintroduce the iteration-order hazard `DESIGN.md` §7 warns about — same
-/// reasoning as `Catalog::min_clearance`.
+/// reasoning as `Catalog::door_reservation`.
 #[derive(Resource, Default, Deref, DerefMut)]
 pub(crate) struct DoorAttempts(HashMap<OpenDoorId, u32>);
 
@@ -181,12 +237,9 @@ fn should_spawn(
     anchors: &[TilePos],
     grid_size: f32,
 ) -> bool {
-    match culling {
-        CullingPolicy::Disabled => true,
-        CullingPolicy::Radius(radius_px) => {
-            nearest_anchor_distance(rect, anchors) <= radius_px / grid_size
-        }
-    }
+    culling
+        .spawn_radius()
+        .is_none_or(|radius_px| nearest_anchor_distance(rect, anchors) <= radius_px / grid_size)
 }
 
 /// Policy gate for despawning a room entity. Never with zero anchors — a
@@ -201,12 +254,9 @@ fn should_cull(
     if anchors.is_empty() {
         return false;
     }
-    match culling {
-        CullingPolicy::Disabled => false,
-        CullingPolicy::Radius(radius_px) => {
-            nearest_anchor_distance(rect, anchors) > radius_px * CULL_HYSTERESIS / grid_size
-        }
-    }
+    culling
+        .despawn_radius()
+        .is_some_and(|radius_px| nearest_anchor_distance(rect, anchors) > radius_px / grid_size)
 }
 
 /// Force-set, not a blind `insert_resource` in `Plugin::build`: this must
@@ -277,8 +327,35 @@ fn doors_by_distance(
     anchors: &[TilePos],
     radius_tiles: f32,
 ) -> Vec<OpenDoorId> {
+    // Local query per anchor through the door index, unless the radius is
+    // so large that scanning the whole frontier is cheaper.
+    let mut near: Vec<OpenDoorId> = Vec::new();
+    let mut scan = false;
+    for &anchor in anchors {
+        match square_around(anchor, radius_tiles) {
+            Some(rect)
+                if !scan_is_cheaper(
+                    rect,
+                    catalog.spatial_cell_size(),
+                    layout.open_door_count(),
+                ) =>
+            {
+                near.extend(layout.doors_near(rect));
+            }
+            _ => scan = true,
+        }
+    }
+    if scan {
+        near = layout.open_doors().map(|(id, _)| id).collect();
+    }
+    near.sort_by_key(|id| (id.slot, id.generation));
+    near.dedup();
+
     let mut candidates: Vec<(OpenDoorId, f32)> = Vec::new();
-    for (id, door) in layout.open_doors() {
+    for id in near {
+        let Some(door) = layout.door(id) else {
+            continue;
+        };
         let Some(pos) = open_door_pos(layout, catalog, *door) else {
             continue;
         };
@@ -294,7 +371,9 @@ fn doors_by_distance(
             candidates.push((id, nearest));
         }
     }
-    candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Distance, then slot: a total order, so ties don't depend on the
+    // spatial query's output order.
+    candidates.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.slot.cmp(&b.0.slot)));
     candidates.into_iter().map(|(id, _)| id).collect()
 }
 
@@ -304,7 +383,7 @@ fn abandon_door(
     door_id: OpenDoorId,
     abandoned_events: &mut MessageWriter<DoorAbandoned>,
 ) {
-    let Some((_, &door)) = layout.open_doors().find(|(id, _)| *id == door_id) else {
+    let Some(&door) = layout.door(door_id) else {
         return;
     };
     let at = open_door_pos(layout, catalog, door);
@@ -333,6 +412,10 @@ pub(crate) fn generate(
     mut counters: ResMut<PlacementCountersRes>,
     room_weights: Res<RoomWeights>,
     config: Res<GenerationConfig>,
+    radii: Res<StreamingRadii>,
+    order: Res<GenerationOrder>,
+    mut reach: ResMut<OriginReach>,
+    mut frontier: ResMut<OriginFrontierRes>,
     anchors: Query<&GlobalTransform, With<GenerationAnchor>>,
     mut placed_events: MessageWriter<RoomPlaced>,
     mut abandoned_events: MessageWriter<DoorAbandoned>,
@@ -358,12 +441,20 @@ pub(crate) fn generate(
 
     let mut placed_this_frame = 0;
 
-    // Bootstrap: the first placement, centered on the first anchor. Nothing
-    // else can start generation — the door loop below only fills doors that
-    // already exist, and an empty Layout has none.
+    // Bootstrap: the first placement, centered on the first anchor — or on
+    // the origin under `FromOrigin`, so where the anchor happened to stand
+    // doesn't shift the whole dungeon. Nothing else can start generation —
+    // the door loop below only fills doors that already exist, and an empty
+    // Layout has none.
     if layout.placed_count() == 0 {
-        let Some(&anchor) = anchors.first() else {
-            return;
+        let anchor = match *order {
+            GenerationOrder::FromOrigin => TilePos::default(),
+            GenerationOrder::NearestAnchor => {
+                let Some(&anchor) = anchors.first() else {
+                    return;
+                };
+                anchor
+            }
         };
         match place_start_room(
             &mut layout,
@@ -398,9 +489,6 @@ pub(crate) fn generate(
         }
     }
 
-    let radius_tiles = config.generation_radius / grid_size;
-    let ordered = doors_by_distance(&layout, &catalog, &anchors, radius_tiles);
-
     // Meta-generation inputs, assembled once per frame. The ceiling arrives
     // pre-converted into `progress`'s counting convention (see
     // `progress_ceiling`) so `candidate_weight` compares like with like.
@@ -410,16 +498,60 @@ pub(crate) fn generate(
     // the whole loop.
     let resolved_ref = config.resolved.as_ref();
     let table = room_weights.0.as_deref();
+    let started = Instant::now();
+    let generation_tiles = radii.generation_radius.max(0.0) / grid_size;
 
-    for door_id in ordered {
-        if placed_this_frame >= ROOMS_PER_FRAME {
+    // Which door to fill next, per `GenerationOrder`. `NearestAnchor` takes
+    // a snapshot of the in-radius doors once per frame; `FromOrigin` asks
+    // the frontier each time, because a fresh placement can open a door
+    // nearer the origin than the rest of the queue.
+    let mut snapshot = match *order {
+        GenerationOrder::NearestAnchor => {
+            *reach = OriginReach::default();
+            doors_by_distance(&layout, &catalog, &anchors, generation_tiles).into_iter()
+        }
+        GenerationOrder::FromOrigin => {
+            let travelled = anchors
+                .iter()
+                .map(|a| (a.x as f32).hypot(a.y as f32))
+                .fold(reach.travelled / grid_size, f32::max);
+            reach.travelled = travelled * grid_size;
+            reach.radius = reach.travelled + radii.generation_radius.max(0.0);
+            Vec::new().into_iter()
+        }
+    };
+    let reach_tiles = reach.radius / grid_size;
+
+    loop {
+        let over_budget = match *order {
+            GenerationOrder::NearestAnchor => placed_this_frame >= ROOMS_PER_FRAME,
+            GenerationOrder::FromOrigin => {
+                placed_this_frame >= MAX_PLACEMENTS_PER_FRAME
+                    || started.elapsed() >= GENERATION_BUDGET
+            }
+        };
+        if over_budget || ceiling.is_some_and(|max| counters.progress >= max) {
             break;
         }
-        // An earlier iteration this same frame may already have closed this
-        // door via multi-door satisfaction (place.rs's satisfied_doors).
-        if layout.open_doors().all(|(id, _)| id != door_id) {
-            continue;
-        }
+        let door_id = match *order {
+            GenerationOrder::NearestAnchor => {
+                let Some(door_id) = snapshot.next() else {
+                    break;
+                };
+                // An earlier iteration this same frame may already have
+                // closed this door via multi-door satisfaction.
+                if layout.door(door_id).is_none() {
+                    continue;
+                }
+                door_id
+            }
+            GenerationOrder::FromOrigin => {
+                let Some(door_id) = frontier.0.next(&layout, &catalog, reach_tiles) else {
+                    break;
+                };
+                door_id
+            }
+        };
 
         let weight_params = WeightParams {
             table,
@@ -457,6 +589,14 @@ pub(crate) fn generate(
                         at: placement.origin,
                     });
                 }
+            }
+            // Deterministic order cannot retry: a retry later would draw
+            // from the RNG at a point that depends on frame timing, and the
+            // door would block the whole queue meanwhile. With reservations
+            // every open door is fillable by its cap, so this only happens
+            // when the weight table zeroes every candidate.
+            None if *order == GenerationOrder::FromOrigin => {
+                abandon_door(&mut layout, &catalog, door_id, &mut abandoned_events);
             }
             None => {
                 let failures = attempts.entry(door_id).or_insert(0);
@@ -519,8 +659,12 @@ pub(crate) fn apply_regeneration(
     catalog: Res<CatalogRes>,
     mut layout: ResMut<LayoutRes>,
     mut rng: ResMut<GenRng>,
+    mut current_seed: ResMut<GenerationSeed>,
     mut attempts: ResMut<DoorAttempts>,
     mut counters: ResMut<PlacementCountersRes>,
+    mut frontier: ResMut<OriginFrontierRes>,
+    mut reach: ResMut<OriginReach>,
+    mut cursor: ResMut<SpawnCursor>,
     rooms: Query<(Entity, &RoomWorld)>,
     mut despawned_events: MessageWriter<RoomDespawned>,
     mut commands: Commands,
@@ -547,9 +691,14 @@ pub(crate) fn apply_regeneration(
     }
 
     *layout = LayoutRes::default();
+    *frontier = OriginFrontierRes::default();
+    *reach = OriginReach::default();
+    *cursor = SpawnCursor::default();
     *attempts = DoorAttempts::default();
     *counters = PlacementCountersRes(PlacementCounters::new(&catalog));
+    let seed = resolve_seed(seed);
     *rng = GenRng::new(seed);
+    current_seed.0 = seed;
 }
 
 /// Drains the spawn queue and the cull queue against the (already updated)
@@ -559,11 +708,13 @@ pub(crate) fn apply_regeneration(
 /// Spawned entities are a cache over the Layout (DESIGN.md §1): this system
 /// never touches `LayoutRes`, so culling can't reopen doors or break seed
 /// reproduction (DESIGN.md §8).
+#[allow(clippy::too_many_arguments)] // a Bevy system's parameters are its inputs
 pub(crate) fn sync_entities(
     mut commands: Commands,
+    mut cursor: ResMut<SpawnCursor>,
     catalog: Res<CatalogRes>,
     layout: Res<LayoutRes>,
-    config: Res<GenerationConfig>,
+    radii: Res<StreamingRadii>,
     handle: Res<LdtkHandle>,
     anchors: Query<&GlobalTransform, With<GenerationAnchor>>,
     rooms: Query<(Entity, &RoomWorld, Option<&Announced>, Option<&Children>)>,
@@ -618,7 +769,7 @@ pub(crate) fn sync_entities(
             min: placement.origin,
             size: def.size,
         };
-        if should_cull(config.culling, rect, &anchors, grid_size) {
+        if should_cull(radii.culling, rect, &anchors, grid_size) {
             doomed.push((room_world.placement.0, entity, placement.room));
         }
     }
@@ -628,29 +779,77 @@ pub(crate) fn sync_entities(
         despawned_events.write(RoomDespawned { room });
     }
 
-    // Spawn queue: every placement without a live room entity whose
-    // nearest point is within the policy's radius, in Layout order (a
-    // `HashMap` anywhere in this path would make entity spawn order — and
-    // so every `Entity` id consumers see — vary run to run, DESIGN.md §7).
+    // Spawn queue. Never a pass over the whole Layout: under a radius the
+    // room index answers "what's near an anchor" locally, and under
+    // `Disabled` a cursor skips placements already spawned.
     let live: HashSet<PlacementId> = rooms.iter().map(|(_, w, _, _)| w.placement).collect();
-    let mut spawned_this_frame = 0;
-    for (placement_id, placement) in layout.iter() {
-        if spawned_this_frame >= ROOM_SPAWNS_PER_FRAME {
-            break;
+    let mut queue: Vec<(f32, PlacementId)> = Vec::new();
+    match radii.culling.spawn_radius() {
+        None => {
+            while cursor.0 < layout.placed_count() && queue.len() < ROOM_SPAWNS_PER_FRAME {
+                let id = PlacementId(u32::try_from(cursor.0).unwrap_or(u32::MAX));
+                cursor.0 += 1;
+                if !live.contains(&id) {
+                    queue.push((0.0, id));
+                }
+            }
         }
-        if live.contains(&placement_id) {
+        Some(radius_px) => {
+            let radius_tiles = radius_px / grid_size;
+            let mut near: Vec<PlacementId> = Vec::new();
+            let mut scan = false;
+            for &anchor in &anchors {
+                match square_around(anchor, radius_tiles) {
+                    Some(rect)
+                        if !scan_is_cheaper(
+                            rect,
+                            catalog.spatial_cell_size(),
+                            layout.placed_count(),
+                        ) =>
+                    {
+                        near.extend(layout.nearby(rect));
+                    }
+                    _ => scan = true,
+                }
+            }
+            if scan {
+                near = layout.iter().map(|(id, _)| id).collect();
+            }
+            near.sort_unstable_by_key(|id| id.0);
+            near.dedup();
+            for id in near {
+                if live.contains(&id) {
+                    continue;
+                }
+                let Some(placement) = layout.get(id) else {
+                    continue;
+                };
+                let Some(def) = catalog.get(placement.room) else {
+                    continue;
+                };
+                let rect = TileRect {
+                    min: placement.origin,
+                    size: def.size,
+                };
+                if should_spawn(radii.culling, rect, &anchors, grid_size) {
+                    queue.push((nearest_anchor_distance(rect, &anchors), id));
+                }
+            }
+            // Nearest first, so the per-frame cap only ever delays the far
+            // edge; placement order breaks ties (a `HashMap` anywhere in
+            // this path would make entity spawn order — and every `Entity`
+            // id consumers see — vary run to run, DESIGN.md §7).
+            queue.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.0.cmp(&b.1.0)));
+        }
+    }
+
+    for (_, placement_id) in queue.into_iter().take(ROOM_SPAWNS_PER_FRAME) {
+        let Some(placement) = layout.get(placement_id) else {
             continue;
-        }
+        };
         let Some(def) = catalog.get(placement.room) else {
             continue;
         };
-        let rect = TileRect {
-            min: placement.origin,
-            size: def.size,
-        };
-        if !should_spawn(config.culling, rect, &anchors, grid_size) {
-            continue;
-        }
         commands.spawn((
             LdtkProjectHandle::from(handle.0.clone()),
             LevelSet::from_iids([def.iid.clone()]),
@@ -663,7 +862,42 @@ pub(crate) fn sync_entities(
                 placement: placement_id,
             },
         ));
-        spawned_this_frame += 1;
+    }
+}
+
+/// Keeps [`StreamingRadii`] sane whenever anything writes it — the builder,
+/// a settings menu, a debug slider: negative radii are zeroed and the
+/// despawn ring is pushed out to [`CullingPolicy::min_despawn`], so no
+/// configuration can load and unload a room on alternate frames. Each
+/// correction is logged, since it means the caller asked for something
+/// other than what runs.
+pub(crate) fn sanitize_radii(catalog: Res<CatalogRes>, mut radii: ResMut<StreamingRadii>) {
+    if !radii.is_changed() {
+        return;
+    }
+    let grid_size = catalog.grid_size() as f32;
+    let fixed = StreamingRadii {
+        generation_radius: radii.generation_radius.max(0.0),
+        culling: radii.culling.sanitized(grid_size),
+    };
+    if fixed != *radii {
+        warn!(
+            "StreamingRadii adjusted to keep a hysteresis band between the spawn and despawn \
+             rings: {:?} -> {:?}",
+            *radii, fixed
+        );
+        // Without change detection, so the correction itself isn't seen as
+        // a fresh write next frame.
+        *radii.bypass_change_detection() = fixed;
+    }
+    if let Some(spawn) = fixed.culling.spawn_radius()
+        && fixed.generation_radius < spawn
+    {
+        warn!(
+            "generation radius {} is inside the spawn radius {spawn}: rooms will appear at the \
+             edge of view as they are placed, instead of being placed ahead of it",
+            fixed.generation_radius
+        );
     }
 }
 
@@ -829,7 +1063,7 @@ mod tests {
         // Radius 10px at 2px/tile: respawn within 5 tiles, despawn beyond
         // 5 * 1.25 = 6.25 tiles. Against `unit_rect` (max corner (1, 1)),
         // an anchor's x minus 1 is its distance in tiles.
-        let policy = CullingPolicy::Radius(10.0);
+        let policy = CullingPolicy::radius(10.0);
         let grid_size = 2.0;
 
         let near = [TilePos { x: 2, y: 0 }]; // 1 tile away
@@ -860,8 +1094,46 @@ mod tests {
     fn no_anchors_idles_instead_of_culling() {
         // The normal state during loading (DESIGN.md §3) — a missing anchor
         // must not wipe the world.
-        let policy = CullingPolicy::Radius(10.0);
+        let policy = CullingPolicy::radius(10.0);
         assert!(!should_spawn(policy, unit_rect(), &[], 2.0));
         assert!(!should_cull(policy, unit_rect(), &[], 2.0));
+    }
+
+    /// No configuration — even a despawn ring set *inside* the spawn ring —
+    /// may load and unload a room as the anchor wobbles back and forth.
+    /// Simulates a room's spawned state while the anchor oscillates between
+    /// every pair of adjacent tiles (and pairs two tiles apart, the snap
+    /// width `min_despawn` guards): each oscillation may change the state
+    /// at most once.
+    #[test]
+    fn sanitized_rings_never_thrash() {
+        let grid_size = 2.0;
+        for (spawn, despawn) in [(10.0, 5.0), (10.0, 10.0), (10.0, 10.5), (40.0, 41.0)] {
+            let policy = CullingPolicy::Radius { spawn, despawn }.sanitized(grid_size);
+            let min = CullingPolicy::min_despawn(spawn, grid_size);
+            assert!(policy.despawn_radius().is_some_and(|d| d >= min));
+            for start in 0..60 {
+                for wobble in [1, 2] {
+                    let mut spawned = false;
+                    let mut flips = 0;
+                    for step in 0..20 {
+                        let x = start + if step % 2 == 0 { 0 } else { wobble };
+                        let at = [TilePos { x, y: 0 }];
+                        let next = if spawned {
+                            !should_cull(policy, unit_rect(), &at, grid_size)
+                        } else {
+                            should_spawn(policy, unit_rect(), &at, grid_size)
+                        };
+                        flips += usize::from(next != spawned);
+                        spawned = next;
+                    }
+                    assert!(
+                        flips <= 1,
+                        "spawn {spawn} despawn {despawn}: anchor wobbling at x={start}±{wobble} \
+                         flipped the room {flips} times"
+                    );
+                }
+            }
+        }
     }
 }

@@ -11,6 +11,7 @@
 
 pub(crate) mod catalog;
 pub(crate) mod error;
+pub(crate) mod frontier;
 pub(crate) mod geom;
 pub(crate) mod layout;
 pub(crate) mod place;

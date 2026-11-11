@@ -41,7 +41,8 @@ pub mod prelude {
     pub use crate::generator::weight::CountBy;
     pub use crate::plugin::{
         CatalogRes, CullingPolicy, DoorAbandoned, GenerationAnchor, GenerationFailed,
-        GenerationSet, GenerationSettled, GenerationState, GeneratorPlugin, LayoutRes, Regenerate,
-        RoomDespawned, RoomPlaced, RoomSpawned, RoomWeights, apply_weights,
+        GenerationOrder, GenerationSeed, GenerationSet, GenerationSettled, GenerationState,
+        GeneratorPlugin, LayoutRes, OriginReach, Regenerate, RoomDespawned, RoomPlaced,
+        RoomSpawned, RoomWeights, StreamingRadii, apply_weights,
     };
 }

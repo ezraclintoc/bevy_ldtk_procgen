@@ -16,6 +16,9 @@ rand = "0.10.1"
 
 [dev-dependencies]
 serde_json = "1"
+# Widgets for the `testing` example's debug menu. A dev-dependency, so the
+# feature only reaches example and test builds, never the library's own.
+bevy = { version = "0.18.0", features = ["experimental_bevy_feathers"] }
 
 [lints.rust]
 unsafe_code = "deny"

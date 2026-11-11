@@ -13,6 +13,67 @@ use bevy::prelude::*;
 
 use bevy_ldtk_procgen::prelude::*;
 
+/// The project every example loads, relative to `assets/`. Override with the
+/// first command-line argument to try another map:
+///
+/// ```text
+/// cargo run --example full -- my_project_18px.ldtk
+/// ```
+pub const DEFAULT_MAP: &str = "ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk";
+
+/// [`DEFAULT_MAP`], or the first command-line argument when one is given. A
+/// project that fails validation is reported through `GenerationFailed`, so
+/// a bad path or an invalid map shows up in the log rather than as a panic.
+pub fn map_path() -> String {
+    let path = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| DEFAULT_MAP.to_string());
+    info!("map: {path}");
+    path
+}
+
+/// The library must not panic on a bad catalog (`AGENTS.md`, lint policy) —
+/// `GenerationFailed` is how that surfaces instead. Every example logs it, so
+/// a map passed on the command line that fails validation says why rather
+/// than leaving an empty screen.
+pub fn show_generation_failure(mut failed: MessageReader<GenerationFailed>) {
+    for GenerationFailed(errors) in failed.read() {
+        for error in errors.iter() {
+            error!("catalog invalid: {error:?}");
+        }
+    }
+}
+
+/// Longest side, in tiles, a room may have and still count as a hall.
+pub const MAX_HALL_TILES: u32 = 7;
+
+/// The "halls only" weight table (`DESIGN.md` §9): a room is a hall when no
+/// side is longer than [`MAX_HALL_TILES`] — by footprint, not by name,
+/// because the bundled project's junctions (`Level_39`–`Level_43`, 4x5 tees
+/// and a crossing) aren't named `Hallway_*`, and without them the maze can't
+/// branch. Every hall weighs its door count: dead ends (1) are the least
+/// likely pick, straights and corners (2) next, junctions (3–4) the most —
+/// which keeps the frontier growing instead of capping itself off. Everything
+/// bigger weighs 0. A map with no hall-sized rooms gets every room, weighted
+/// the same way, rather than generating nothing.
+///
+/// Index `i` is `RoomId(i)`, which is catalog order (`Catalog::iter`).
+#[allow(clippy::cast_precision_loss)] // door counts are tiny
+pub fn hall_weights(catalog: &Catalog) -> Vec<f32> {
+    let is_hall = |def: &RoomDef| def.size.width.max(def.size.height) <= MAX_HALL_TILES;
+    let any_halls = catalog.iter().any(is_hall);
+    catalog
+        .iter()
+        .map(|def| {
+            if !any_halls || is_hall(def) {
+                def.doors.len() as f32
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
 /// Pixels per second of WASD movement. A constant speed with no acceleration:
 /// the examples are about generation, not character control.
 pub const WALK_SPEED: f32 = 260.0;
@@ -54,20 +115,24 @@ pub fn move_with_wasd<M: Component>(
     }
 }
 
-/// R → regenerate: discard the layout and every spawned room, then generate
-/// again around the anchor's current position.
+/// R → regenerate with a fresh random seed; Shift+R → regenerate the
+/// current seed again (`GenerationSeed`), around the anchor's current
+/// position. Either way the layout and every spawned room are discarded.
 ///
 /// The library takes a **message**, never a keybinding (`DESIGN.md` §10) —
-/// binding `R` is the example's job. The seed is `None`, i.e. a fresh random
-/// one, because reproducing the example's hard-coded seed would rebuild the
-/// identical dungeon and look like the key did nothing.
+/// binding the keys is the example's job.
 pub fn regenerate_on_key(
     keys: Res<ButtonInput<KeyCode>>,
+    seed: Res<GenerationSeed>,
     mut regenerate: MessageWriter<Regenerate>,
 ) {
-    if keys.just_pressed(KeyCode::KeyR) {
-        regenerate.write(Regenerate::default());
+    if !keys.just_pressed(KeyCode::KeyR) {
+        return;
     }
+    let same = keys.any_pressed([KeyCode::ShiftLeft, KeyCode::ShiftRight]);
+    regenerate.write(Regenerate {
+        seed: same.then_some(seed.0),
+    });
 }
 
 /// Smoothed follow cam, for the examples whose anchor is *not* the camera.

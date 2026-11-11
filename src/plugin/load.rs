@@ -111,6 +111,26 @@ pub(crate) fn poll_ldtk_load(
             };
             match build_catalog(project.json_data()) {
                 Ok(catalog) => {
+                    // Not an error — the rest of the catalog works — but the
+                    // room is dead weight, and only the editor can fix it.
+                    for def in catalog.iter() {
+                        if let Some((a, b)) = catalog.self_blocking_doors(def) {
+                            let door = |i: usize| {
+                                def.doors
+                                    .get(i)
+                                    .map(|d| format!("door {i} ({:?}, width {})", d.dir, d.width))
+                                    .unwrap_or_default()
+                            };
+                            warn!(
+                                "{}: {} and {} are too close together — the rooms that would \
+                                 fill them overlap, so this level can never be placed. Move \
+                                 the doors apart in LDtk.",
+                                def.identifier,
+                                door(a),
+                                door(b)
+                            );
+                        }
+                    }
                     // One-time resolution of config tag names against the
                     // loaded catalog (DESIGN.md §2) — never by string inside
                     // the placement loop.

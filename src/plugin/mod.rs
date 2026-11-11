@@ -60,14 +60,160 @@ pub enum CullingPolicy {
     /// Every placement spawns and stays spawned; the consumer drives any
     /// despawning themselves.
     Disabled,
-    /// Keep a room spawned while it is within `f32` PIXELS of any anchor;
-    /// despawn it once it is beyond that distance times a small hysteresis
-    /// margin. The band between the two thresholds keeps whatever state
-    /// the room is already in, so an anchor wobbling on the boundary
-    /// doesn't flicker (DESIGN.md §8). Should be at least
-    /// `generation_radius`, or a room can be culled the same frame it is
-    /// placed.
-    Radius(f32),
+    /// Two rings around the anchors, in PIXELS, both measured to a room's
+    /// nearest point: a room spawns once it is within `spawn` of an anchor
+    /// and despawns once it is beyond `despawn` from every anchor. Between
+    /// them is a hysteresis band where a room keeps whatever state it is
+    /// already in, so an anchor wobbling on a ring doesn't flicker rooms in
+    /// and out (DESIGN.md §8).
+    ///
+    /// The band is enforced, not trusted: `despawn` is raised to at least
+    /// [`CullingPolicy::min_despawn`] if set lower (with a warning), so no
+    /// configuration — including one changed at runtime — can load and
+    /// unload the same room on alternate frames.
+    Radius {
+        /// Spawn ring, px.
+        spawn: f32,
+        /// Despawn ring, px. Must clear `spawn` by the minimum band.
+        despawn: f32,
+    },
+}
+
+impl CullingPolicy {
+    /// Spawn within `spawn` px, despawn beyond `spawn` × 1.25.
+    pub fn radius(spawn: f32) -> Self {
+        CullingPolicy::Radius {
+            spawn,
+            despawn: spawn * DEFAULT_HYSTERESIS,
+        }
+    }
+
+    /// A room spawns while its nearest point is within this many pixels of
+    /// an anchor. `None` under [`CullingPolicy::Disabled`]: every room spawns.
+    pub fn spawn_radius(self) -> Option<f32> {
+        match self {
+            CullingPolicy::Disabled => None,
+            CullingPolicy::Radius { spawn, .. } => Some(spawn),
+        }
+    }
+
+    /// A room despawns once its nearest point is beyond this many pixels from
+    /// every anchor. `None` under [`CullingPolicy::Disabled`]: nothing
+    /// despawns.
+    pub fn despawn_radius(self) -> Option<f32> {
+        match self {
+            CullingPolicy::Disabled => None,
+            CullingPolicy::Radius { despawn, .. } => Some(despawn),
+        }
+    }
+
+    /// The smallest despawn ring that still leaves a real hysteresis band
+    /// outside `spawn`, for a project whose tiles are `grid_size` px: 10% of
+    /// the spawn ring or two tiles, whichever is wider. Two tiles because an
+    /// anchor's position is snapped to a tile before distances are taken —
+    /// a band narrower than that snap could be crossed both ways by a
+    /// sub-tile wobble.
+    pub fn min_despawn(spawn: f32, grid_size: f32) -> f32 {
+        spawn + (spawn * 0.1).max(grid_size * 2.0)
+    }
+
+    /// This policy with negative radii zeroed and `despawn` raised to
+    /// [`CullingPolicy::min_despawn`] where it was too close to `spawn`.
+    pub fn sanitized(self, grid_size: f32) -> Self {
+        match self {
+            CullingPolicy::Disabled => CullingPolicy::Disabled,
+            CullingPolicy::Radius { spawn, despawn } => {
+                let spawn = spawn.max(0.0);
+                CullingPolicy::Radius {
+                    spawn,
+                    despawn: despawn.max(Self::min_despawn(spawn, grid_size)),
+                }
+            }
+        }
+    }
+}
+
+/// [`CullingPolicy::radius`]'s despawn ring over its spawn ring.
+const DEFAULT_HYSTERESIS: f32 = 1.25;
+
+/// The three rings, in pixels, that decide what exists around the anchors:
+///
+/// - **generation** — open doors within it are filled. This is the "math"
+///   ring: placing a room is ~10 µs of pure bookkeeping in the [`Layout`],
+///   no entities, so it can run far ahead of what is loaded.
+/// - **spawn** / **despawn** — [`CullingPolicy`]: which placed rooms have
+///   entities.
+///
+/// Generation should normally reach past the spawn ring, so rooms exist as
+/// math before the anchor gets close enough to load them, and a fast anchor
+/// never meets an unplaced edge. Each ring is independent; the plugin warns
+/// (but allows) a generation ring inside the spawn ring.
+///
+/// A resource, not a builder-only setting, so it can change at runtime — a
+/// settings menu, a zoom level, a debug slider — and the next frame
+/// generates and culls against the new values. Shrinking it never touches
+/// the Layout (culling only despawns entities), so nothing placed is lost.
+#[derive(Resource, Debug, Clone, Copy, PartialEq)]
+pub struct StreamingRadii {
+    /// Open doors within this many pixels are filled. Under
+    /// [`GenerationOrder::FromOrigin`], this is how far past the anchor's
+    /// furthest-ever distance from the origin generation reaches.
+    pub generation_radius: f32,
+    /// Which placed rooms are spawned, and which are despawned.
+    pub culling: CullingPolicy,
+}
+
+/// Which open door is filled next — and so whether the dungeon depends on
+/// how it was explored.
+///
+/// Changing it mid-run takes effect immediately, but a dungeon only has the
+/// [`GenerationOrder::FromOrigin`] guarantee if it was generated that way
+/// from its first room: send [`Regenerate`] after switching.
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GenerationOrder {
+    /// Fill the doors nearest any anchor first, within the generation
+    /// radius of an anchor. The cheapest to keep up with a moving anchor,
+    /// but path-dependent: the same seed explored along a different route
+    /// places different rooms.
+    #[default]
+    NearestAnchor,
+    /// Deterministic: start at tile (0, 0) and always fill the open door
+    /// nearest that origin. Generation reaches a disc around the origin of
+    /// radius (furthest the anchors have ever been from it) + generation
+    /// radius — see [`OriginReach`]. With a fixed seed and a weight table
+    /// that doesn't read live state, the same rooms land in the same places
+    /// however the dungeon was walked, and however many rooms each frame
+    /// got through.
+    ///
+    /// The cost is area: the disc fills completely, so walking `d` pixels
+    /// in a straight line places ~`d²` worth of rooms rather than a
+    /// corridor's worth (~10 µs each, spread over frames by the budget).
+    FromOrigin,
+}
+
+/// The seed the current dungeon is generated from — the one passed to
+/// [`GeneratorPlugin::with_seed`] or [`Regenerate`], or, when none was, the
+/// random one the plugin drew. Every dungeon has one, so any dungeon can be
+/// reported and rebuilt: send `Regenerate { seed: Some(seed.0) }`.
+///
+/// Maintained by the plugin; read it, don't write it. Rebuilding is exact
+/// under [`GenerationOrder::FromOrigin`]; under
+/// [`GenerationOrder::NearestAnchor`] the anchor's route is an input too
+/// (`DESIGN.md` §7), so the same seed walked differently diverges.
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationSeed(pub u64);
+
+/// How far [`GenerationOrder::FromOrigin`] generation reaches, in pixels,
+/// from world (0, 0): the furthest any anchor has been from it plus the
+/// generation radius. Maintained by the plugin; read it, don't write it.
+/// Stays 0 under [`GenerationOrder::NearestAnchor`].
+#[derive(Resource, Debug, Clone, Copy, Default, PartialEq)]
+pub struct OriginReach {
+    /// Furthest distance any anchor has reached from the origin, px.
+    pub travelled: f32,
+    /// Generation reaches this far from the origin, px: `travelled` plus
+    /// [`StreamingRadii::generation_radius`].
+    pub radius: f32,
 }
 
 /// Either a path to load via `AssetServer` (the common case — see this
@@ -108,24 +254,33 @@ pub struct GeneratorPlugin {
     max_rooms: Option<(usize, CountBy)>,
     start: StartRoom,
     culling: CullingPolicy,
+    order: GenerationOrder,
     weight_config: crate::generator::weight::WeightConfig,
 }
 
 impl GeneratorPlugin {
     /// Load the project at `path` (relative to the asset root) and keep
-    /// rooms spawned within `generation_radius` pixels of an anchor.
+    /// rooms spawned within `view_radius` pixels of an anchor.
     ///
-    /// Doors are only filled within that radius, which is what bounds the
-    /// work per frame and keeps the dungeon streaming rather than generating
-    /// a whole level up front (`DESIGN.md` §3).
-    pub fn new(path: impl Into<String>, generation_radius: f32) -> Self {
+    /// The other rings derive from it (each overridable — see
+    /// [`StreamingRadii`]): rooms are placed out to twice the view radius,
+    /// so the Layout runs ahead of what is loaded, and despawned beyond
+    /// 1.25×. Doors are only filled within the generation ring, which is
+    /// what keeps the dungeon streaming rather than generating a whole level
+    /// up front (`DESIGN.md` §3).
+    pub fn new(path: impl Into<String>, view_radius: f32) -> Self {
+        Self::with_source(ProjectSource::Path(path.into()), view_radius)
+    }
+
+    fn with_source(source: ProjectSource, view_radius: f32) -> Self {
         Self {
-            source: ProjectSource::Path(path.into()),
-            generation_radius,
+            source,
+            generation_radius: view_radius * 2.0,
             seed: None,
             max_rooms: None,
             start: StartRoom::default(),
-            culling: CullingPolicy::Radius(generation_radius * 2.0),
+            culling: CullingPolicy::radius(view_radius),
+            order: GenerationOrder::default(),
             weight_config: Default::default(),
         }
     }
@@ -133,16 +288,23 @@ impl GeneratorPlugin {
     /// For a consumer that wants to control asset loading/preloading
     /// themselves — `DESIGN.md` §3's original `Handle<LdtkProject>` input.
     /// `GeneratorPlugin::new` covers the common case without this.
-    pub fn from_handle(handle: Handle<LdtkProject>, generation_radius: f32) -> Self {
-        Self {
-            source: ProjectSource::Handle(handle),
-            generation_radius,
-            seed: None,
-            max_rooms: None,
-            start: StartRoom::default(),
-            culling: CullingPolicy::Radius(generation_radius * 2.0),
-            weight_config: Default::default(),
-        }
+    pub fn from_handle(handle: Handle<LdtkProject>, view_radius: f32) -> Self {
+        Self::with_source(ProjectSource::Handle(handle), view_radius)
+    }
+
+    /// How far, in pixels, open doors are filled — the "math" ring. Defaults
+    /// to twice the view radius.
+    pub fn with_generation_radius(mut self, radius: f32) -> Self {
+        self.generation_radius = radius;
+        self
+    }
+
+    /// Which open door is filled next (defaults to
+    /// [`GenerationOrder::NearestAnchor`]). [`GenerationOrder::FromOrigin`]
+    /// makes the dungeon independent of how it is explored.
+    pub fn with_order(mut self, order: GenerationOrder) -> Self {
+        self.order = order;
+        self
     }
 
     /// Fix the RNG seed, making the dungeon reproducible run to run — the
@@ -171,8 +333,7 @@ impl GeneratorPlugin {
     }
 
     /// Culling policy (DESIGN.md §8). Defaults to
-    /// `CullingPolicy::Radius(generation_radius * 2.0)` — rooms stay
-    /// spawned well past the distance at which they are generated.
+    /// `CullingPolicy::radius(view_radius)`.
     pub fn with_culling(mut self, culling: CullingPolicy) -> Self {
         self.culling = culling;
         self
@@ -195,16 +356,24 @@ impl Plugin for GeneratorPlugin {
     /// (`AssetServer`, `LdtkSettings`) is left to a `Startup` system: see
     /// `ProjectSourceRes` and `systems::enforce_ldtk_settings`.
     fn build(&self, app: &mut App) {
+        let seed = systems::resolve_seed(self.seed);
         app.insert_resource(ProjectSourceRes(self.source.clone()))
-            .insert_resource(GenRng::new(self.seed))
+            .insert_resource(GenerationSeed(seed))
+            .insert_resource(GenRng::new(seed))
             .insert_resource(GenerationConfig {
-                generation_radius: self.generation_radius,
                 max_rooms: self.max_rooms.clone(),
                 start: self.start.clone(),
-                culling: self.culling,
                 weight_config: self.weight_config.clone(),
                 resolved: None,
             })
+            .insert_resource(StreamingRadii {
+                generation_radius: self.generation_radius,
+                culling: self.culling,
+            })
+            .insert_resource(self.order)
+            .init_resource::<OriginReach>()
+            .init_resource::<systems::OriginFrontierRes>()
+            .init_resource::<systems::SpawnCursor>()
             .init_resource::<RoomWeights>()
             .init_resource::<DoorAttempts>()
             .init_resource::<PlacementCountersRes>()
@@ -227,6 +396,7 @@ impl Plugin for GeneratorPlugin {
                 Update,
                 (
                     systems::apply_regeneration,
+                    systems::sanitize_radii,
                     systems::generate,
                     systems::sync_entities,
                 )

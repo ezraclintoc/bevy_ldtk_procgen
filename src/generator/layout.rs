@@ -1,10 +1,12 @@
 //! `Layout`, `Placement`, `OpenDoor`. See ARCHITECTURE.md §3.
 //!
 //! `Layout::commit` does no geometry of its own — matching a candidate
-//! against open doors and checking overlap is `place.rs`'s job (not written
-//! yet); this file only keeps `placements`, `open_doors`, and the spatial
-//! index from drifting out of sync with each other, the way the old
-//! `WorldState::add_room` did for its two structures (ARCHITECTURE.md §5).
+//! against open doors and checking overlap is `place.rs`'s job; this file
+//! only keeps `placements`, `open_doors`, and the two spatial indices (rooms
+//! and open doors) from drifting out of sync with each other, the way the
+//! old `WorldState::add_room` did for its two structures (ARCHITECTURE.md §5).
+
+use std::collections::HashMap;
 
 use super::catalog::Catalog;
 use super::geom::{Dir, OpenDoorId, PlacementId, RoomId, TilePos, TileRect, TileSize};
@@ -63,6 +65,18 @@ pub struct Layout {
     /// `OpenDoorId` from before that point no longer matches.
     open_doors: Vec<(u32, Option<OpenDoor>)>,
     free_door_slots: Vec<u32>,
+    /// Per slot, the rect the door is indexed under in `doors_index`: its
+    /// own tile plus its reservation. Kept so `close_door` can unindex it.
+    door_rects: Vec<TileRect>,
+    /// Open door -> its id. Point lookups only, never iterated, so it can't
+    /// leak `HashMap` order into placement (`DESIGN.md` §7).
+    door_ids: HashMap<OpenDoor, OpenDoorId>,
+    /// Open doors by `door_rects`. Every query placement makes about doors —
+    /// which ones a candidate connects to, which reservations it touches,
+    /// which are near an anchor — is local, so this keeps it independent of
+    /// how many doors the frontier holds. Built lazily, like
+    /// `placements_index`.
+    doors_index: Option<SpatialHash<OpenDoorId>>,
     /// `None` until the first `commit`: the cell size comes from
     /// `Catalog::spatial_cell_size`, unknown when `Layout::default()` runs
     /// (e.g. `init_resource` at plugin build time, before any catalog is
@@ -100,6 +114,40 @@ impl Layout {
                     (id, door)
                 })
             })
+    }
+
+    /// The open door `id` names, or `None` if it has been closed (or its slot
+    /// reused since). Direct slot lookup — no scan.
+    pub fn door(&self, id: OpenDoorId) -> Option<&OpenDoor> {
+        let (generation, slot) = self.open_doors.get(id.slot as usize)?;
+        if *generation != id.generation {
+            return None;
+        }
+        slot.as_ref()
+    }
+
+    /// How many doors are open right now.
+    pub fn open_door_count(&self) -> usize {
+        self.door_ids.len()
+    }
+
+    /// The id of `door` if it is currently open.
+    pub fn open_door_id(&self, door: OpenDoor) -> Option<OpenDoorId> {
+        self.door_ids.get(&door).copied()
+    }
+
+    /// Every open door whose tile or reservation may touch `rect` — a
+    /// broad-phase result like [`Layout::nearby`]; the caller does the
+    /// exact test. Sorted by slot, so the order is placement history, not
+    /// grid layout.
+    pub fn doors_near(&self, rect: TileRect) -> Vec<OpenDoorId> {
+        let mut out = self
+            .doors_index
+            .as_ref()
+            .map(|index| index.query(rect))
+            .unwrap_or_default();
+        out.sort_by_key(|id| id.slot);
+        out
     }
 
     /// Every placement with its id, in placement order — entry `i` is
@@ -149,7 +197,7 @@ impl Layout {
     /// room's own door indices with the `OpenDoorId` it satisfies — both
     /// sides are handled here so a connected doorway never becomes a
     /// frontier door: closing the existing side but opening the new side
-    /// would leave a door whose clearance strip lies inside its neighbour
+    /// would leave a door whose reservation lies inside its neighbour
     /// (it was just connected through), unffillable by any candidate.
     /// This method does no position math itself, only bookkeeping; the
     /// matching is `place.rs`'s `door_connections`.
@@ -184,21 +232,50 @@ impl Layout {
             self.close_door(*close);
         }
 
-        for (i, _door) in def.doors.iter().enumerate() {
+        for (i, door) in def.doors.iter().enumerate() {
             if connections.iter().any(|(satisfied, _)| *satisfied == i) {
                 continue;
             }
             let door_index = u8::try_from(i).unwrap_or(u8::MAX);
-            self.open_door(OpenDoor {
-                placement: id,
-                door: door_index,
-            });
+            let pos = origin + door.local_pos;
+            let tile = TileRect {
+                min: pos,
+                size: TileSize {
+                    width: 1,
+                    height: 1,
+                },
+            };
+            let rect = catalog
+                .door_reservation(pos, door.dir, door.width)
+                .map_or(tile, |reserved| tile.union(reserved));
+            self.open_new_door(
+                catalog,
+                OpenDoor {
+                    placement: id,
+                    door: door_index,
+                },
+                rect,
+            );
         }
 
         Some(id)
     }
 
-    fn open_door(&mut self, door: OpenDoor) -> OpenDoorId {
+    fn open_new_door(&mut self, catalog: &Catalog, door: OpenDoor, rect: TileRect) -> OpenDoorId {
+        let id = self.claim_door_slot(door);
+        if let Some(stored) = self.door_rects.get_mut(id.slot as usize) {
+            *stored = rect;
+        } else {
+            self.door_rects.push(rect);
+        }
+        self.door_ids.insert(door, id);
+        self.doors_index
+            .get_or_insert_with(|| SpatialHash::new(catalog.spatial_cell_size()))
+            .insert(rect, id);
+        id
+    }
+
+    fn claim_door_slot(&mut self, door: OpenDoor) -> OpenDoorId {
         if let Some(slot_index) = self.free_door_slots.pop() {
             // The generation was already bumped when this slot was freed
             // (see `close_door`) — reuse it as-is so this new door's id
@@ -232,9 +309,16 @@ impl Layout {
             return None;
         }
         let taken = slot.take();
-        if taken.is_some() {
+        if let Some(door) = taken {
             *generation = generation.wrapping_add(1);
             self.free_door_slots.push(id.slot);
+            self.door_ids.remove(&door);
+            if let (Some(index), Some(rect)) = (
+                self.doors_index.as_mut(),
+                self.door_rects.get(id.slot as usize),
+            ) {
+                index.remove(*rect, id);
+            }
         }
         taken
     }

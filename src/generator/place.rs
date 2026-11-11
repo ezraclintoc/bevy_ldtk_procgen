@@ -3,13 +3,15 @@
 //!
 //! Validity of a placement, checked in order of cost:
 //! 1. room-vs-room footprint overlap — `fits`, via the spatial index;
-//! 2. door clearance — the candidate must not occupy the clearance strip
-//!    (`Catalog::clearance_strip`) of any open door it is not connecting
-//!    to, and the strips beyond its own doors must be free of rooms it is
-//!    not connecting to. This is what keeps every door either connected or
-//!    genuinely open: no placement can seal another room's door shut by
-//!    landing on the space a connecting room would need, and no room is
-//!    born with a door opening into another room's interior.
+//! 2. door reservations — every open door reserves the full footprint of
+//!    a room that could fill it (`Catalog::door_reservation`). The
+//!    candidate must not occupy the reservation of any open door it is not
+//!    connecting to, and each of its own new doors must get a reservation
+//!    that is free of rooms and of every other reservation. This is what
+//!    keeps every door either connected or fillable: no placement can seal
+//!    another room's door shut, two open doors can never compete for the
+//!    same space, and no room is born with a door opening into another
+//!    room's interior or wall.
 //!
 //! `attempt_door` is the single-door primitive — deliberately scoped no
 //! wider than that. Deferred to whatever drives it across frames (the
@@ -48,18 +50,6 @@ pub struct WeightParams<'a> {
     pub ceiling: Option<usize>,
 }
 
-/// One tile step in the direction a door of `dir` opens toward — e.g. a
-/// door facing `N` sits on a room's top edge, so the space beyond it is one
-/// row further north (higher y, this crate's y-up convention).
-fn step(dir: Dir) -> TilePos {
-    match dir {
-        Dir::N => TilePos { x: 0, y: 1 },
-        Dir::S => TilePos { x: 0, y: -1 },
-        Dir::E => TilePos { x: 1, y: 0 },
-        Dir::W => TilePos { x: -1, y: 0 },
-    }
-}
-
 /// Rooms with a door facing `dir`, width `width`, as `(RoomId, door_index)`
 /// — a room can have more than one door matching, so the specific door is
 /// part of the result, not just the room.
@@ -95,7 +85,7 @@ fn candidate_origin(
 ) -> Option<TilePos> {
     let def = catalog.get(candidate)?;
     let door = def.doors.get(door_index as usize)?;
-    let target = existing_door_pos + step(existing_dir);
+    let target = existing_door_pos + existing_dir.step();
     Some(target - door.local_pos)
 }
 
@@ -137,14 +127,14 @@ fn fits(layout: &Layout, catalog: &Catalog, room: RoomId, origin: TilePos) -> bo
 /// ways, with EXACTLY EQUAL width — never at the same tile, and a wider
 /// candidate door in front of a narrower opening would seal the extra lanes
 /// while technically touching the opening. `candidate_origin` solved for
-/// `existing_door_pos + step(existing_dir) == candidate_door_pos`, so the
+/// `existing_door_pos + existing_dir.step() == candidate_door_pos`, so the
 /// equality accounts for that same step — the bug `attempt_door`'s own test
 /// caught, when this compared `origin + d.local_pos == open_pos` directly,
 /// which can never be true by construction.
 ///
-/// A linear scan over open doors, not the spatial index — deferred
-/// alongside the rest of door spatial indexing (`layout.rs`'s `open_doors`
-/// slot-map `TODO`); same cost profile as `placement_valid`'s other passes.
+/// Only open doors within one tile of the candidate's body can connect to
+/// it, so the door spatial index (`Layout::doors_near`) bounds the search.
+/// Result in slot order, like everything `doors_near` returns.
 fn door_connections(
     layout: &Layout,
     catalog: &Catalog,
@@ -155,8 +145,15 @@ fn door_connections(
         return Vec::new();
     };
 
+    let body = TileRect {
+        min: origin,
+        size: def.size,
+    };
     let mut out = Vec::new();
-    for (open_id, open) in layout.open_doors() {
+    for open_id in layout.doors_near(body.inflate(1)) {
+        let Some(open) = layout.door(open_id) else {
+            continue;
+        };
         let Some(open_pos) = open_door_pos(layout, catalog, *open) else {
             continue;
         };
@@ -173,7 +170,7 @@ fn door_connections(
         for (i, d) in def.doors.iter().enumerate() {
             if d.dir == open_door_def.dir.opposite()
                 && d.width == open_door_def.width
-                && origin + d.local_pos + step(d.dir) == open_pos
+                && origin + d.local_pos + d.dir.step() == open_pos
             {
                 out.push((i, open_id));
                 break;
@@ -223,10 +220,7 @@ pub fn attempt_door<R: RngExt>(
     rng: &mut R,
     weights: WeightParams,
 ) -> Option<PlacementId> {
-    let door: OpenDoor = layout
-        .open_doors()
-        .find(|(id, _)| *id == door_id)
-        .map(|(_, d)| *d)?;
+    let door: OpenDoor = *layout.door(door_id)?;
     let pos = open_door_pos(layout, catalog, door)?;
 
     let placement = layout.get(door.placement)?;
@@ -321,21 +315,26 @@ pub fn attempt_door<R: RngExt>(
 /// Full validity of one candidate placement — everything that must hold
 /// before `commit`.
 ///
+/// The invariant it maintains, over the whole Layout: every open door's
+/// reservation (`Catalog::door_reservation`) is free of room bodies and
+/// disjoint from every other open door's reservation. That is what keeps
+/// each open door fillable — by its reserved room, at worst — for as long
+/// as it stays open, so no placement can ever seal a door shut.
+///
 /// Checks, cheapest first:
 /// 1. footprint overlap via the spatial hash (`fits`);
-/// 2. the candidate must not occupy the clearance strip (`Catalog::
-///    clearance_strip`) of any open door it isn't connecting to — landing
-///    on that space would seal the door shut for good, since every room
-///    that could ever fill it now intersects the placed body;
-/// 3. the strip beyond each of the candidate's own doors must be free of
-///    rooms it isn't connecting to — a door born facing another room's
-///    interior can never be filled.
+/// 2. the candidate's body must not touch the reservation of any open door
+///    it isn't connecting to;
+/// 3. each of the candidate's own new (unconnected) doors must get a
+///    reservation that is free of room bodies and disjoint from both the
+///    surviving open doors' reservations and its sibling new doors'.
 ///
 /// "Connecting to" is decided by `door_connections`' predicate: opposite
 /// directions, exactly equal width, footprints one tile apart. The open
 /// door being filled is always among those (that's what `candidate_origin`
 /// solved for), and any *other* open door the candidate happens to satisfy
-/// is equally legitimate — both close on commit.
+/// is equally legitimate — both close on commit, so their reservations stop
+/// mattering.
 fn placement_valid(
     layout: &Layout,
     catalog: &Catalog,
@@ -348,8 +347,8 @@ fn placement_valid(
     };
 
     // Every open door this placement would connect through, computed once —
-    // reused by both clearance passes and, after this returns true, by the
-    // commit itself (via `door_connections`, same predicate).
+    // reused by both reservation passes and, after this returns true, by
+    // the commit itself (via `door_connections`, same predicate).
     let connections = door_connections(layout, catalog, room, origin);
     let connects_through = |open: OpenDoorId| connections.iter().any(|(_, id)| *id == open);
 
@@ -371,64 +370,68 @@ fn placement_valid(
         size: def.size,
     };
 
-    // 2. Don't occupy any unconnected open door's clearance strip.
-    for (open_id, open) in layout.open_doors() {
-        if connects_through(open_id) {
-            continue;
-        }
-        let Some(open_pos) = open_door_pos(layout, catalog, *open) else {
-            continue;
-        };
-        let Some((dir, width)) = strip_dir_width(layout, catalog, *open) else {
-            continue;
-        };
-        let Some(strip) = catalog.clearance_strip(open_pos, dir, width) else {
-            continue;
-        };
-        if overlaps(rect, strip) {
-            return false;
-        }
+    // Whether `area` touches the reservation of an open door that stays
+    // open after this commit. Local: the door index returns only doors
+    // whose reservation can reach `area`.
+    let hits_surviving = |area: TileRect| {
+        layout.doors_near(area).into_iter().any(|open_id| {
+            !connects_through(open_id)
+                && layout
+                    .door(open_id)
+                    .and_then(|open| open_door_reservation(layout, catalog, *open))
+                    .is_some_and(|reserved| overlaps(area, reserved))
+        })
+    };
+
+    // 2. Don't occupy any surviving open door's reservation.
+    if hits_surviving(rect) {
+        return false;
     }
 
-    // 3. The candidate's own doors must open onto free space (modulo
-    //    connections): no strip beyond one of them may intersect another
-    //    room's body.
+    // 3. The candidate's own new doors must open onto reservable space.
+    let mut fresh: Vec<TileRect> = Vec::new();
     for (i, d) in def.doors.iter().enumerate() {
         if connections.iter().any(|(ci, _)| *ci == i) {
             continue;
         }
-        let door_pos = origin + d.local_pos;
-        let Some(strip) = catalog.clearance_strip(door_pos, d.dir, d.width) else {
+        let Some(reserved) = catalog.door_reservation(origin + d.local_pos, d.dir, d.width) else {
             continue;
         };
-        let blocked = layout.nearby(strip).into_iter().any(|id| {
-            layout.get(id).is_some_and(|placement| {
-                catalog.get(placement.room).is_some_and(|other_def| {
-                    overlaps(
-                        strip,
-                        TileRect {
-                            min: placement.origin,
-                            size: other_def.size,
-                        },
-                    )
-                })
-            })
-        });
+        let blocked = !body_free(layout, catalog, reserved)
+            || hits_surviving(reserved)
+            || fresh.iter().any(|&r| overlaps(reserved, r));
         if blocked {
             return false;
         }
+        fresh.push(reserved);
     }
 
     true
 }
 
-/// The `(direction, width)` of one open door — with `open_door_pos`'s
-/// position, the full lookup key for its clearance strip.
-fn strip_dir_width(layout: &Layout, catalog: &Catalog, open: OpenDoor) -> Option<(Dir, u8)> {
+/// Whether no placed room's body intersects `area`.
+fn body_free(layout: &Layout, catalog: &Catalog, area: TileRect) -> bool {
+    layout.nearby(area).into_iter().all(|id| {
+        layout.get(id).is_none_or(|placement| {
+            catalog.get(placement.room).is_none_or(|other_def| {
+                !overlaps(
+                    area,
+                    TileRect {
+                        min: placement.origin,
+                        size: other_def.size,
+                    },
+                )
+            })
+        })
+    })
+}
+
+/// One open door's reservation, located in the world.
+fn open_door_reservation(layout: &Layout, catalog: &Catalog, open: OpenDoor) -> Option<TileRect> {
+    let pos = open_door_pos(layout, catalog, open)?;
     let placement = layout.get(open.placement)?;
-    let def = catalog.get(placement.room)?;
-    let door = def.doors.get(open.door as usize)?;
-    Some((door.dir, door.width))
+    let door = catalog.get(placement.room)?.doors.get(open.door as usize)?;
+    catalog.door_reservation(pos, door.dir, door.width)
 }
 
 /// Which room generation begins from. DESIGN.md §2, "Starting room": the
@@ -459,7 +462,27 @@ impl StartRoom {
 
 /// Every room `start` admits, in `Catalog::iter` order — i.e. `RoomId`
 /// order, since IDs are catalog indices.
+///
+/// `Any` and `Tagged` skip rooms with self-blocking doors
+/// (`Catalog::self_blocking_doors`): the start room is the one placement
+/// that isn't validated, so such a room would start the dungeon with doors
+/// that can never be filled. If that leaves nothing, the unfiltered set is
+/// used — a degraded start beats no start. `Named` is the developer's
+/// explicit choice and is honoured as-is.
 fn start_candidates<'a>(catalog: &'a Catalog, start: &StartRoom) -> Vec<(RoomId, &'a RoomDef)> {
+    let all = admitted(catalog, start);
+    if matches!(start, StartRoom::Named(_)) {
+        return all;
+    }
+    let sound: Vec<_> = all
+        .iter()
+        .copied()
+        .filter(|(_, def)| catalog.self_blocking_doors(def).is_none())
+        .collect();
+    if sound.is_empty() { all } else { sound }
+}
+
+fn admitted<'a>(catalog: &'a Catalog, start: &StartRoom) -> Vec<(RoomId, &'a RoomDef)> {
     match start {
         StartRoom::Any => catalog
             .iter()
@@ -578,14 +601,6 @@ mod tests {
     }
 
     #[test]
-    fn step_points_one_tile_away_from_each_direction() {
-        assert_eq!(step(Dir::N), TilePos { x: 0, y: 1 });
-        assert_eq!(step(Dir::S), TilePos { x: 0, y: -1 });
-        assert_eq!(step(Dir::E), TilePos { x: 1, y: 0 });
-        assert_eq!(step(Dir::W), TilePos { x: -1, y: 0 });
-    }
-
-    #[test]
     fn candidate_origin_aligns_footprints_exactly() {
         // Hand-derived the same way as catalog.rs's local_pos test: place
         // Room_Spawn_1 (12x8, S-door local_pos=(8,0)) at the origin, then
@@ -622,7 +637,7 @@ mod tests {
             .find(|d| d.dir == Dir::N)
             .expect("checked above");
         let placed_footprint = origin + n_door.local_pos;
-        let target = existing_door_pos + step(Dir::S);
+        let target = existing_door_pos + Dir::S.step();
         assert_eq!(
             placed_footprint, target,
             "the candidate's own N-door footprint must land exactly on the target tile"
@@ -884,13 +899,13 @@ mod tests {
         //   A = Room_Spawn_1 (12x8) at (0,0); its E-door footprint (11,2).
         //   B = the 3x5 room (one W-door at local (0,1), one E-door at
         //       (2,1)) filling A's E-door: origin (12,1), body x∈[12,15),
-        //       y∈[1,6). Its E-door lands at (14,2), strip x∈[15,17),
-        //       y∈[2,4).
+        //       y∈[1,6). Its E-door lands at (14,2); the space just
+        //       beyond it is x∈[15,17), y∈[2,4).
         //   C = the 4x2 room at (15,3): body x∈[15,19), y∈[3,5) — touching
         //       B's east edge (strict < means no overlap) but squarely on
-        //       B's E-door strip.
+        //       B's E-door reservation.
         //
-        // A connector for B's E-door would need a body on that strip, so
+        // A connector for B's E-door would need a body on that space, so
         // once C exists B's E-door can never be filled: `placement_valid`
         // must reject B, and accept it when C isn't there. (The 5x11
         // two-W-door room was tried here first and is rejected even against
@@ -965,17 +980,18 @@ mod tests {
 
         assert!(
             !placement_valid(&layout, &catalog, room_b, origin, e_door),
-            "the candidate's E-door strip (x∈[15,17), y∈[2,4)) is now occupied \
-             by C's body — the door could never be filled"
+            "the space beyond the candidate's E-door (x∈[15,17), y∈[2,4)) is now \
+             occupied by C's body — the door could never be filled"
         );
     }
 
     #[test]
-    fn streamed_generation_keeps_strips_clear_doors_fillable_and_rooms_disjoint() {
+    fn streamed_generation_keeps_reservations_clear_and_rooms_disjoint() {
         // The full invariant suite over a long seeded run: at every step,
         // (a) footprints are pairwise disjoint, (b) every open door's
-        // clearance strip is unoccupied, so no door was ever sealed, and
-        // (c) filling continues to make progress (no premature stall).
+        // reservation is free of room bodies and of every other open door's
+        // reservation, so no door was ever sealed or put in competition
+        // with another, and (c) filling continues to make progress.
         let catalog = load_catalog();
         let mut layout = Layout::default();
         let mut rng = SmallRng::seed_from_u64(2024);
@@ -1024,29 +1040,20 @@ mod tests {
                 }
             }
 
-            // (b) every open door's strip is unoccupied by any room body.
-            for (_, open) in layout.open_doors().collect::<Vec<_>>() {
-                let pos = open_door_pos(&layout, &catalog, *open).expect("live open door");
-                let (dir, width) =
-                    strip_dir_width(&layout, &catalog, *open).expect("live open door");
-                let Some(strip) = catalog.clearance_strip(pos, dir, width) else {
-                    continue;
-                };
-                for (_, placement) in layout.iter() {
-                    let other = catalog.get(placement.room).expect("placed room");
+            // (b) reservations clear of bodies and pairwise disjoint.
+            let reserved: Vec<TileRect> = layout
+                .open_doors()
+                .filter_map(|(_, open)| open_door_reservation(&layout, &catalog, *open))
+                .collect();
+            for (i, &r) in reserved.iter().enumerate() {
+                assert!(
+                    body_free(&layout, &catalog, r),
+                    "round {round}: reservation {r:?} is occupied by a room"
+                );
+                for &other in reserved.iter().skip(i + 1) {
                     assert!(
-                        !overlaps(
-                            strip,
-                            TileRect {
-                                min: placement.origin,
-                                size: other.size,
-                            }
-                        ),
-                        "round {round}: open door's strip {strip:?} at {pos:?} is occupied \
-                         by room at {:?} (size {:?}, door of {:?})",
-                        placement.origin,
-                        other.size,
-                        open
+                        !overlaps(r, other),
+                        "round {round}: reservations {r:?} and {other:?} overlap"
                     );
                 }
             }
@@ -1163,5 +1170,309 @@ mod tests {
         let a = first.iter().next().expect("just placed").1;
         let b = second.iter().next().expect("just placed").1;
         assert_eq!(*a, *b, "same seed must reproduce the same start placement");
+    }
+
+    /// Tiles a door's footprint covers: `width` tiles along its edge,
+    /// starting at `local_pos` (the footprint's min corner).
+    fn door_tiles(pos: TilePos, dir: Dir, width: u8) -> Vec<TilePos> {
+        (0..i32::from(width))
+            .map(|i| match dir {
+                Dir::N | Dir::S => pos + TilePos { x: i, y: 0 },
+                Dir::E | Dir::W => pos + TilePos { x: 0, y: i },
+            })
+            .collect()
+    }
+
+    /// Every door-interference violation in `layout`, described. A door of a
+    /// placed room must be in exactly one of two states:
+    /// - **connected**: the tiles one step beyond its footprint are exactly
+    ///   the footprint of one other room's door facing back, same width —
+    ///   and neither of the two is still in the open set;
+    /// - **open**: the tiles beyond it are empty and it is in the open set.
+    ///
+    /// Anything else — a door facing a wall, half-facing another door, a
+    /// connected door still on the frontier, a door closed with nothing
+    /// behind it — is interference.
+    fn door_violations(layout: &Layout, catalog: &Catalog) -> Vec<String> {
+        let open: Vec<OpenDoor> = layout.open_doors().map(|(_, d)| *d).collect();
+        let is_open = |placement: PlacementId, door: usize| {
+            open.iter()
+                .any(|d| d.placement == placement && d.door as usize == door)
+        };
+        let placement_at = |pos: TilePos| {
+            layout.iter().find_map(|(id, p)| {
+                let def = catalog.get(p.room)?;
+                TileRect {
+                    min: p.origin,
+                    size: def.size,
+                }
+                .contains(pos)
+                .then_some(id)
+            })
+        };
+
+        let mut out = Vec::new();
+        for (pid, p) in layout.iter() {
+            let def = catalog.get(p.room).expect("placed room");
+            for (di, d) in def.doors.iter().enumerate() {
+                let here = p.origin + d.local_pos;
+                let beyond: Vec<TilePos> = door_tiles(here, d.dir, d.width)
+                    .into_iter()
+                    .map(|t| t + d.dir.step())
+                    .collect();
+                let owners: Vec<Option<PlacementId>> =
+                    beyond.iter().map(|&t| placement_at(t)).collect();
+                let who = format!(
+                    "{} door {di} ({:?}, width {}) at {here:?}",
+                    def.identifier, d.dir, d.width
+                );
+
+                if owners.iter().all(Option::is_none) {
+                    if !is_open(pid, di) {
+                        out.push(format!("{who}: faces empty space but is not open"));
+                    }
+                    continue;
+                }
+                let Some(Some(other)) = owners.first().copied() else {
+                    out.push(format!("{who}: partly faces empty space, partly a room"));
+                    continue;
+                };
+                if owners.iter().any(|o| *o != Some(other)) {
+                    out.push(format!("{who}: faces more than one room / partly empty"));
+                    continue;
+                }
+                let q = layout.get(other).expect("placed");
+                let q_def = catalog.get(q.room).expect("placed room");
+                let mate = q_def.doors.iter().position(|e| {
+                    e.dir == d.dir.opposite()
+                        && e.width == d.width
+                        && q.origin + e.local_pos == here + d.dir.step()
+                });
+                match mate {
+                    None => out.push(format!(
+                        "{who}: faces the wall of {} at {:?}",
+                        q_def.identifier, q.origin
+                    )),
+                    Some(ei) => {
+                        if is_open(pid, di) || is_open(other, ei) {
+                            out.push(format!("{who}: connected but still open"));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// Streams generation the way `generate` does — repeatedly fill the
+    /// frontier — and returns the layout. No abandonment: a door that can't
+    /// be filled just stays open, which the checker accepts.
+    fn grow(seed: u64, rounds: usize) -> (Catalog, Layout) {
+        let catalog = load_catalog();
+        let layout = grow_with(&catalog, seed, rounds);
+        (catalog, layout)
+    }
+
+    fn grow_with(catalog: &Catalog, seed: u64, rounds: usize) -> Layout {
+        let catalog = catalog;
+        let mut layout = Layout::default();
+        let mut rng = SmallRng::seed_from_u64(seed);
+        place_start_room(
+            &mut layout,
+            catalog,
+            &StartRoom::Any,
+            TilePos { x: 0, y: 0 },
+            &mut rng,
+            WeightParams::default(),
+        )
+        .expect("Any must always match");
+        for _ in 0..rounds {
+            let doors: Vec<OpenDoorId> = layout.open_doors().map(|(id, _)| id).collect();
+            for door_id in doors {
+                let _ = attempt_door(
+                    &mut layout,
+                    catalog,
+                    door_id,
+                    &mut rng,
+                    WeightParams::default(),
+                );
+            }
+        }
+        layout
+    }
+
+    /// The 512px Mossy Cavern project: a second grid size (32× the bundled
+    /// one) with variable-width doors (1–3 tiles), which the bundled catalog
+    /// doesn't have. Gitignored — its tileset's licence forbids
+    /// redistribution — so this skips where the file isn't present.
+    #[test]
+    fn local_512px_map_keeps_door_invariants() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/ezraclintoc_maaot-mossy-cavern_512px_variabledoors.ldtk"
+        );
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            eprintln!("skipped: {path} not present (local-only asset)");
+            return;
+        };
+        let catalog = build_catalog(&serde_json::from_str(&raw).unwrap()).unwrap();
+        assert_eq!(catalog.grid_size(), 512);
+
+        let mut failures = Vec::new();
+        let mut total = 0;
+        for seed in 0..64 {
+            let layout = grow_with(&catalog, seed, 8);
+            total += layout.placed_count();
+            failures.extend(
+                door_violations(&layout, &catalog)
+                    .into_iter()
+                    .map(|v| format!("seed {seed}: {v}")),
+            );
+            for (id, d) in layout.open_doors() {
+                let mut probe = layout.clone();
+                let mut rng = SmallRng::seed_from_u64(seed);
+                if attempt_door(&mut probe, &catalog, id, &mut rng, WeightParams::default())
+                    .is_none()
+                {
+                    failures.push(format!(
+                        "seed {seed}: open door at {:?} can't be filled",
+                        open_door_pos(&layout, &catalog, *d)
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} violations, first 20:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        // Growth is the map's business (most of its rooms are dead ends),
+        // so only check that generation got past the start room at all.
+        eprintln!("512px: {total} rooms over 64 seeds");
+        assert!(total > 64, "512px dungeons never grew: {total} rooms");
+    }
+
+    #[test]
+    fn no_door_interference_across_many_seeds() {
+        let mut failures = Vec::new();
+        for seed in 0..64 {
+            let (catalog, layout) = grow(seed, 8);
+            for v in door_violations(&layout, &catalog) {
+                failures.push(format!("seed {seed}: {v}"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} door violations, first 20:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn every_open_door_stays_fillable() {
+        // The regression this guards: rooms used to be validated only
+        // against a door-width strip, so a neighbour landing beside it
+        // sealed the door anyway — most of the frontier ended up dead. Now
+        // every door left open after a long run must still accept a room.
+        let mut dead = Vec::new();
+        for seed in 0..16 {
+            let (catalog, layout) = grow(seed, 10);
+            for (id, d) in layout.open_doors() {
+                let mut probe = layout.clone();
+                let mut rng = SmallRng::seed_from_u64(seed);
+                if attempt_door(&mut probe, &catalog, id, &mut rng, WeightParams::default())
+                    .is_none()
+                {
+                    dead.push(format!(
+                        "seed {seed}: door at {:?}",
+                        open_door_pos(&layout, &catalog, *d)
+                    ));
+                }
+            }
+        }
+        assert!(
+            dead.is_empty(),
+            "{} unfillable open doors:\n{}",
+            dead.len(),
+            dead.join("\n")
+        );
+    }
+
+    /// Cost of placement as the dungeon grows, in deterministic order: always
+    /// fill the open door nearest the origin. Not a correctness test — run
+    /// with `cargo test --release --lib bench_ -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "benchmark; run explicitly in release"]
+    fn bench_placement_scaling() {
+        let catalog = load_catalog();
+        // Door-count weights, as the halls example uses: keeps the frontier
+        // growing instead of capping itself off.
+        let table: Vec<f32> = catalog.iter().map(|d| d.doors.len() as f32).collect();
+        let weights = WeightParams {
+            table: Some(&table),
+            ..WeightParams::default()
+        };
+        let mut layout = Layout::default();
+        let mut rng = SmallRng::seed_from_u64(7);
+        place_start_room(
+            &mut layout,
+            &catalog,
+            &StartRoom::Any,
+            TilePos { x: 0, y: 0 },
+            &mut rng,
+            weights,
+        )
+        .unwrap();
+
+        let mut frontier = crate::generator::frontier::OriginFrontier::default();
+        let target = 100_000;
+        let bucket = 10_000;
+        let mut t_place = std::time::Duration::ZERO;
+        let mut t_pick = std::time::Duration::ZERO;
+        let mut attempts = 0u32;
+        let mut failures = 0u32;
+        println!("rooms    open   pick-door/op   attempt/op   fail%");
+        while layout.placed_count() < target {
+            let t0 = std::time::Instant::now();
+            let Some(door) = frontier.next(&layout, &catalog, f32::INFINITY) else {
+                println!("frontier closed at {}", layout.placed_count());
+                break;
+            };
+            t_pick += t0.elapsed();
+            let t1 = std::time::Instant::now();
+            let before = layout.placed_count();
+            if attempt_door(&mut layout, &catalog, door, &mut rng, weights).is_none() {
+                failures += 1;
+                layout.close_door(door); // abandon: one full pool exhausted
+            }
+            t_place += t1.elapsed();
+            attempts += 1;
+            if layout.placed_count() != before && layout.placed_count() % bucket == 0 {
+                println!(
+                    "{:>6} {:>6}   {:>9.1}us   {:>8.1}us   {:>4.1}",
+                    layout.placed_count(),
+                    layout.open_doors().count(),
+                    t_pick.as_secs_f64() * 1e6 / f64::from(attempts),
+                    t_place.as_secs_f64() * 1e6 / f64::from(attempts),
+                    100.0 * f64::from(failures) / f64::from(attempts),
+                );
+                t_place = std::time::Duration::ZERO;
+                t_pick = std::time::Duration::ZERO;
+                attempts = 0;
+                failures = 0;
+            }
+        }
     }
 }

@@ -7,7 +7,7 @@
 //! AGENTS.md).
 //!
 //! Controls: **WASD / arrows** move the camera (the anchor, so generation
-//! follows you), **R** starts a fresh dungeon — watch the phase reset to
+//! follows you), **R** starts a fresh dungeon (**Shift+R**: same seed) — watch the phase reset to
 //! EXPLORE and the counts climb again.
 //!
 //! What to watch for on the HUD:
@@ -71,12 +71,9 @@ fn main() {
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
         .add_plugins(LdtkPlugin)
         .add_plugins(
-            GeneratorPlugin::new(
-                "ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk",
-                800.0,
-            )
-            .with_seed(424242)
-            .with_max_rooms(CEILING, CountBy::All),
+            GeneratorPlugin::new(common::map_path(), 800.0)
+                .with_seed(424242)
+                .with_max_rooms(CEILING, CountBy::All),
         )
         .add_systems(Startup, (spawn_camera, spawn_hud))
         .add_systems(
@@ -93,7 +90,7 @@ fn main() {
                 common::move_with_wasd::<Camera>,
                 common::regenerate_on_key,
                 warn_on_abandoned_doors,
-                show_generation_failure,
+                common::show_generation_failure,
                 update_hud,
             ),
         )
@@ -171,14 +168,6 @@ fn warn_on_abandoned_doors(mut abandoned: MessageReader<DoorAbandoned>) {
 
 /// `MessageReader` must be taken by value as a system parameter.
 #[allow(clippy::needless_pass_by_value)]
-fn show_generation_failure(mut failed: MessageReader<GenerationFailed>) {
-    for GenerationFailed(errors) in failed.read() {
-        for error in errors.iter() {
-            error!("catalog invalid: {error:?}");
-        }
-    }
-}
-
 #[derive(Component)]
 struct HudText;
 

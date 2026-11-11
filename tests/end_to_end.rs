@@ -201,9 +201,10 @@ fn streaming_generation_runs_end_to_end() {
     // plugin produced across 300 frames):
     //   1. footprints pairwise disjoint — no room was ever placed on
     //      another;
-    //   2. every open door's clearance strip is unoccupied — no placement
-    //      sealed a door shut, and no room was born with a door opening
-    //      into another room's interior.
+    //   2. every open door's reservation is free of rooms and of every
+    //      other open door's reservation — no placement sealed a door shut,
+    //      no two open doors compete for the same space, and no room was
+    //      born with a door opening into another room's interior.
     let placements: Vec<(RoomId, TilePos)> =
         layout.iter().map(|(_, p)| (p.room, p.origin)).collect();
     for (i, &(room_a, origin_a)) in placements.iter().enumerate() {
@@ -225,30 +226,37 @@ fn streaming_generation_runs_end_to_end() {
         }
     }
 
-    let mut open_doors = 0;
+    let mut reserved: Vec<TileRect> = Vec::new();
     for (_, open) in layout.open_doors().collect::<Vec<_>>() {
         let pos = open_door_pos(layout, catalog, *open).expect("open door of a live placement");
         let placement = layout.get(open.placement).expect("live placement");
         let def = catalog.get(placement.room).expect("live room");
         let door = def.doors.get(open.door as usize).expect("live door");
-        let Some(strip) = catalog.clearance_strip(pos, door.dir, door.width) else {
+        let Some(area) = catalog.door_reservation(pos, door.dir, door.width) else {
             continue;
         };
-        open_doors += 1;
         for (_, other) in layout.iter() {
             let other_def = catalog.get(other.room).expect("placed room");
             assert!(
                 !overlaps(
-                    strip,
+                    area,
                     TileRect {
                         min: other.origin,
                         size: other_def.size,
                     },
                 ),
-                "open door's clearance strip at {pos:?} is occupied — the door was sealed"
+                "open door's reservation at {pos:?} is occupied — the door was sealed"
             );
         }
+        for &earlier in &reserved {
+            assert!(
+                !overlaps(area, earlier),
+                "open door's reservation at {pos:?} overlaps another open door's"
+            );
+        }
+        reserved.push(area);
     }
+    let open_doors = reserved.len();
     assert!(
         open_doors > 0,
         "a streaming dungeon must still have open doors ahead of the anchor"

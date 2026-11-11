@@ -7,11 +7,11 @@
 //! AGENTS.md).
 //!
 //! Controls: **WASD / arrows** move the camera (which is the anchor, so the
-//! dungeon streams as you go), **R** regenerates the dungeon around you.
+//! dungeon streams as you go), **R** regenerates the dungeon around you (**Shift+R**: same seed).
 //!
 //! The rest of the set: `testing` is the barest plugin wiring plus a debug
-//! overlay, `full` adds a player, wall collision and visibility, `meta` adds
-//! meta-generation weights.
+//! overlay, `halls` adds a player, wall collision and line of
+//! sight in a hallways-only dungeon, `meta` adds meta-generation weights.
 
 use bevy::prelude::*;
 use bevy_ecs_ldtk::prelude::*;
@@ -31,14 +31,7 @@ fn main() {
     App::new()
         .add_plugins(DefaultPlugins.set(ImagePlugin::default_nearest()))
         .add_plugins(LdtkPlugin)
-        .add_plugins(
-            GeneratorPlugin::new(
-                "ezraclintoc_kenney-tiny-dungeon_16px_fixeddoors.ldtk",
-                800.0,
-            )
-            .with_seed(1234)
-            .with_max_rooms(500, CountBy::All),
-        )
+        .add_plugins(GeneratorPlugin::new(common::map_path(), 800.0).with_seed(1234))
         .add_systems(Startup, (spawn_camera, spawn_hud))
         .add_systems(
             Update,
@@ -47,7 +40,7 @@ fn main() {
                 common::regenerate_on_key,
                 tint_intersection_rooms,
                 warn_on_abandoned_doors,
-                show_generation_failure,
+                common::show_generation_failure,
                 update_hud,
             ),
         )
@@ -74,13 +67,16 @@ const INTERSECTION_DOORS: usize = 4;
 /// a lookup on it could only ever miss and this example would silently attach
 /// nothing.
 ///
-/// The child sprite is offset by half the room's size because a room entity's
-/// translation puts the level's **min corner** on the placement origin, so the
-/// sprite then covers exactly the room. Tiles → pixels happens here, at the
-/// plugin boundary, never inside `generator/` (`ARCHITECTURE.md` §2).
+/// The child sprite is positioned from the event's `at` (the placement origin,
+/// in tiles), not as `size / 2` from the room entity: a room entity's own
+/// translation cancels the level's LDtk world offset, so it is *not* the
+/// room's min corner — `size / 2` from it lands the tint somewhere off in the
+/// background. Tiles → pixels happens here, at the plugin boundary, never
+/// inside `generator/` (`ARCHITECTURE.md` §2).
 #[allow(clippy::cast_precision_loss)] // room sizes are tiny; exact in f32
 fn tint_intersection_rooms(
     mut spawned: MessageReader<RoomSpawned>,
+    rooms: Query<&Transform>,
     catalog: Res<CatalogRes>,
     mut commands: Commands,
 ) {
@@ -93,11 +89,16 @@ fn tint_intersection_rooms(
         if def.doors.len() < INTERSECTION_DOORS {
             continue;
         }
+        let Ok(room_transform) = rooms.get(event.entity) else {
+            continue;
+        };
         let size = Vec2::new(def.size.width as f32, def.size.height as f32) * grid_size;
+        let min = Vec2::new(event.at.x as f32, event.at.y as f32) * grid_size;
+        let local = min + size / 2.0 - room_transform.translation.truncate();
         commands.entity(event.entity).with_children(|parent| {
             parent.spawn((
                 Sprite::from_color(Color::srgba(0.25, 0.55, 1.0, 0.15), size),
-                Transform::from_xyz(size.x / 2.0, size.y / 2.0, 1.0),
+                Transform::from_xyz(local.x, local.y, 1.0),
             ));
         });
     }
@@ -111,16 +112,6 @@ fn warn_on_abandoned_doors(mut abandoned: MessageReader<DoorAbandoned>) {
             "door at {:?} facing {:?} could not be filled",
             event.at, event.dir
         );
-    }
-}
-
-/// The library must not panic on a bad catalog (`AGENTS.md`, lint policy) —
-/// `GenerationFailed` is how that surfaces instead.
-fn show_generation_failure(mut failed: MessageReader<GenerationFailed>) {
-    for GenerationFailed(errors) in failed.read() {
-        for error in errors.iter() {
-            error!("catalog invalid: {error:?}");
-        }
     }
 }
 
