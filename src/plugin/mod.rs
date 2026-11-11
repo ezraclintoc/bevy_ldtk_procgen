@@ -10,7 +10,7 @@ pub(crate) mod events;
 pub(crate) mod load;
 pub(crate) mod systems;
 
-use crate::generator::catalog::Catalog;
+use crate::generator::catalog::{Catalog, DoorSource};
 use crate::generator::layout::Layout;
 use crate::generator::place::StartRoom;
 use crate::generator::weight::CountBy;
@@ -255,6 +255,7 @@ pub struct GeneratorPlugin {
     start: StartRoom,
     culling: CullingPolicy,
     order: GenerationOrder,
+    door_source: DoorSource,
     weight_config: crate::generator::weight::WeightConfig,
 }
 
@@ -281,6 +282,7 @@ impl GeneratorPlugin {
             start: StartRoom::default(),
             culling: CullingPolicy::radius(view_radius),
             order: GenerationOrder::default(),
+            door_source: DoorSource::default(),
             weight_config: Default::default(),
         }
     }
@@ -332,6 +334,14 @@ impl GeneratorPlugin {
         self
     }
 
+    /// Where room doors come from: `Door` entities
+    /// ([`DoorSource::Entities`], the default) or gaps in an `IntGrid` wall
+    /// layer ([`DoorSource::IntGridGaps`]).
+    pub fn with_door_source(mut self, source: DoorSource) -> Self {
+        self.door_source = source;
+        self
+    }
+
     /// Culling policy (DESIGN.md §8). Defaults to
     /// `CullingPolicy::radius(view_radius)`.
     pub fn with_culling(mut self, culling: CullingPolicy) -> Self {
@@ -361,6 +371,7 @@ impl Plugin for GeneratorPlugin {
             .insert_resource(GenerationSeed(seed))
             .insert_resource(GenRng::new(seed))
             .insert_resource(GenerationConfig {
+                door_source: self.door_source.clone(),
                 max_rooms: self.max_rooms.clone(),
                 start: self.start.clone(),
                 weight_config: self.weight_config.clone(),

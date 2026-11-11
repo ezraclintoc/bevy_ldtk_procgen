@@ -31,7 +31,9 @@ pub mod plugin;
 
 /// Everything a consumer normally needs, in one `use`.
 pub mod prelude {
-    pub use crate::generator::catalog::{Catalog, CatalogError, FloatTagId, RoomDef, TagId};
+    pub use crate::generator::catalog::{
+        Catalog, CatalogError, DoorSource, FloatTagId, RoomDef, TagId,
+    };
     pub use crate::generator::error::CatalogErrors;
     pub use crate::generator::geom::{
         Dir, PlacementId, RoomId, TilePos, TileRect, TileSize, overlaps,

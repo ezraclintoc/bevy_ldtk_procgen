@@ -43,8 +43,18 @@ so no setting can load and unload a room on alternate frames.
 
 ### Catalog - `build_catalog` (`generator/catalog.rs`)
 
-Parses levels into `RoomDef`s: size, doors, tags. Door direction comes from which level
-edge the entity touches, and width from its extent along that edge. Rooms are indexed by
+Parses levels into `RoomDef`s: size, doors, tags. Doors come from one of two sources
+(`DoorSource`, chosen at runtime):
+
+- `Entities` (default): `Door` entities. Direction comes from which level edge the entity
+  touches, and width from its extent along that edge.
+- `IntGridGaps { layer }`: each maximal run of empty (`0`) cells along a level edge of
+  the named IntGrid layer is a door that wide; any nonzero value is wall. Corners are
+  excluded, and an open corner is a `DoorAtCorner` error, since its direction would be
+  ambiguous. On the bundled 16px map both sources give identical doors for all 44 rooms
+  (tested).
+
+ Rooms are indexed by
 (direction, width) in a 4-element array, never a `HashMap`, since iteration order would
 break determinism.
 

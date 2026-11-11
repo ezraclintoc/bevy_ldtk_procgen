@@ -10,7 +10,7 @@ use bevy_ecs_ldtk::prelude::*;
 use rand::SeedableRng;
 use rand::rngs::SmallRng;
 
-use crate::generator::catalog::{Catalog, RoomDef, TagId};
+use crate::generator::catalog::{Catalog, DoorSource, RoomDef, TagId};
 use crate::generator::error::CatalogErrors;
 use crate::generator::frontier::OriginFrontier;
 use crate::generator::geom::{OpenDoorId, PlacementId, RoomId, TilePos, TileRect, TileSize};
@@ -169,6 +169,7 @@ pub(crate) fn resolve_seed(seed: Option<u64>) -> u64 {
 /// (DESIGN.md §2).
 #[derive(Resource, Clone)]
 pub(crate) struct GenerationConfig {
+    pub door_source: DoorSource,
     pub max_rooms: Option<(usize, CountBy)>,
     pub start: StartRoom,
     pub weight_config: crate::generator::weight::WeightConfig,

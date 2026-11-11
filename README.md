@@ -30,6 +30,8 @@ FPS is capped by the recording monitor's 60 Hz vsync.*
 
 - Catalog built from an LDtk project: rooms, doors (direction from the level
   edge, any width the art uses), bool and float tags, per-room weights.
+- Doors from `Door` entities, or found automatically from the gaps in an
+  IntGrid wall layer (`with_door_source(DoorSource::IntGridGaps { layer })`).
 - Synchronous generation in a per-frame budget, with the layout as the single
   source of truth.
 - Door-to-door placement with door reservations: every open door keeps the
@@ -90,7 +92,7 @@ fn main() {
 }
 ```
 
-Builder options: `with_generation_radius`, `with_culling`, `with_order`,
+Builder options: `with_generation_radius`, `with_culling`, `with_order`, `with_door_source`,
 `with_start`, `with_max_rooms`, `with_weight_config`.
 
 ## Examples
