@@ -22,7 +22,7 @@ FPS is capped by the recording monitor's 60 Hz vsync.*
 
 | `bevy_ldtk_procgen` | `bevy` | `bevy_ecs_ldtk` |
 | ------------------- | ------ | --------------- |
-| unreleased          | `0.18` | `0.14`          |
+| unreleased          | `0.20` | `0.16`          |
 
 ## Features
 

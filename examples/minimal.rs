@@ -122,7 +122,7 @@ fn spawn_hud(mut commands: Commands) {
     commands.spawn((
         Text::new("state: -\nrooms: -\nhere: -"),
         TextFont {
-            font_size: 18.0,
+            font_size: FontSize::Px(18.0),
             ..default()
         },
         TextColor(Color::WHITE),

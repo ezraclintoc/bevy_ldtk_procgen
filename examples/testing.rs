@@ -56,15 +56,15 @@
 
 use bevy::diagnostic::{DiagnosticsStore, FrameTimeDiagnosticsPlugin};
 use bevy::feathers::FeathersPlugins;
-use bevy::feathers::controls::{SliderProps, checkbox, slider};
+use bevy::feathers::controls::{FeathersCheckbox, FeathersSlider};
 use bevy::feathers::dark_theme::create_dark_theme;
-use bevy::feathers::theme::{ThemedText, UiTheme};
+use bevy::feathers::display::{caption, label};
+use bevy::feathers::theme::UiTheme;
 use bevy::input::mouse::{AccumulatedMouseScroll, MouseScrollUnit};
 use bevy::prelude::*;
 use bevy::ui::Checked;
 use bevy::ui_widgets::{
-    SliderPrecision, SliderRange, SliderStep, SliderValue, checkbox_self_update, observe,
-    slider_self_update,
+    SliderPrecision, SliderRange, SliderStep, SliderValue, checkbox_self_update, slider_self_update,
 };
 use bevy_ecs_ldtk::prelude::*;
 
@@ -143,7 +143,7 @@ fn spawn(mut commands: Commands) {
     commands.spawn((
         Text::new(""),
         TextFont {
-            font_size: 16.0,
+            font_size: FontSize::Px(16.0),
             ..default()
         },
         TextColor(Color::WHITE),
@@ -216,10 +216,12 @@ enum Ring {
 
 fn spawn_menu(mut commands: Commands, overlays: Res<Overlays>) {
     let mut check = |toggle: Toggle, label: &'static str, on: bool| {
-        let mut entity = commands.spawn((
-            checkbox(toggle, Spawn((Text::new(label), ThemedText))),
-            observe(checkbox_self_update),
-        ));
+        let mut entity = commands.spawn_scene(bsn! {
+            @FeathersCheckbox {
+                @caption: bsn! { @caption(label) }
+            }
+        });
+        entity.insert(toggle).observe(checkbox_self_update);
         if on {
             entity.insert(Checked);
         }
@@ -239,23 +241,22 @@ fn spawn_menu(mut commands: Commands, overlays: Res<Overlays>) {
     let separate = check(Toggle::Separate, "Separate rings", overlays.separate);
 
     // A labelled ring slider, as two entities: label, then slider.
-    let mut ring_slider = |ring: Ring, label: &'static str, value: f32| {
-        let label = commands.spawn((Text::new(label), ThemedText)).id();
+    let mut ring_slider = |ring: Ring, text: &'static str, value: f32| {
+        let label = commands.spawn_scene(bsn! { @label(text) }).id();
         let slider = commands
-            .spawn((
-                slider(
-                    SliderProps {
-                        value,
-                        min: RADIUS_MIN,
-                        max: RADIUS_MAX,
-                    },
-                    // `SliderPrecision` is what feathers' label and fill
-                    // update query for — without it the widget never
-                    // redraws.
-                    (SliderStep(50.0), SliderPrecision(0), ring),
-                ),
-                observe(slider_self_update),
-            ))
+            .spawn_scene(bsn! {
+                @FeathersSlider {
+                    @min: RADIUS_MIN,
+                    @max: RADIUS_MAX,
+                }
+                SliderValue({value})
+                SliderStep(50.0)
+                // `SliderPrecision` is what feathers' label and fill update
+                // query for — without it the widget never redraws.
+                SliderPrecision(0)
+            })
+            .insert(ring)
+            .observe(slider_self_update)
             .id();
         [label, slider]
     };
